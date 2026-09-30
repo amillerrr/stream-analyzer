@@ -1,0 +1,21 @@
+# stream-analyzer configuration. Copy it to channels.yaml and edit the channels.
+# Every setting except channels is optional; the values below are the
+# defaults. docs/reference.md lists every setting.
+
+data_dir: ./data                 # buffer, incidents, CSV files and the log
+buffer: 3m                       # kept per channel; every incident gets it as pre-roll
+incident_storage_gb: 20          # cap for data/buffer and data/incidents together; oldest closed incidents go first
+listen: 127.0.0.1:8765           # manual capture, POST /capture?channel=NAME; a loopback address, or "" for none
+
+# name:      letters, digits, dot, underscore and hyphen; used in file names
+#            and in the capture URL
+# url:       a master playlist (one rendition is watched) or a media playlist
+# rendition: which rendition of a master playlist to watch: highest (the
+#            default), lowest, a 0-based index, a WxH resolution, or a
+#            substring of the rendition's URI
+channels:
+  - name: channel1
+    url: https://origin.example.com/live/channel1/index.m3u8
+  - name: channel2
+    url: https://origin.example.com/live/channel2/index.m3u8
+    rendition: 1280x720

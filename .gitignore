@@ -1,0 +1,46 @@
+# Runtime data: rolling buffer, incidents, CSV logs, log file and lock.
+# The location can be changed with data_dir or -data.
+/data/
+
+# Built binaries, including cross-compiled ones
+/stream-analyzer
+/stream-analyzer-*
+*.exe
+
+# Real config with internal stream URLs.
+# channels.example.yaml is committed instead.
+/channels.yaml
+*.local.yaml
+
+# Internal notes: audit findings, incident analysis and design docs
+/docs/audit/
+/docs/superpowers/
+
+# Coding assistant and worktree folders
+/.claude/
+CLAUDE.md
+/.worktrees/
+
+# Secrets, in case any are added later
+.env
+.env.*
+*.pem
+*.key
+*.p12
+
+# Go test, coverage and profiling output
+*.test
+*.out
+*.prof
+coverage.html
+
+# Logs
+*.log
+
+# macOS and editor files
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
