@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/amillerrr/stream-analyzer/internal/analysis"
+	"github.com/amillerrr/stream-analyzer/internal/blackdetect"
 )
 
 // Report is an incident's report.json. It is rewritten as the incident
@@ -41,9 +42,47 @@ type Report struct {
 	// the segments above, whether or not it was long enough to open an
 	// incident.
 	BlackRuns []BlackRun `json:"black_runs"`
+	// Blackdetect is how black was checked.
+	Blackdetect *BlackdetectInfo `json:"blackdetect,omitempty"`
 	// Files lists every evidence file in the incident directory, with its
 	// size and SHA-256, once the incident has closed.
 	Files []EvidenceFile `json:"files,omitempty"`
+}
+
+// BlackdetectInfo is how black was checked: the ffmpeg build found at
+// start, the decoders the segments went through, and every setting,
+// including those that can't be configured.
+type BlackdetectInfo struct {
+	Enabled bool              `json:"enabled"`
+	FFmpeg  blackdetect.Build `json:"ffmpeg"`
+	// DecodersUsed are the decoders ffmpeg named for the segments listed
+	// ("h264 (native)").
+	DecodersUsed []string `json:"decoders_used,omitempty"`
+	// Filter is the filter graph ffmpeg ran, and Map the stream it decoded.
+	Filter string `json:"filter"`
+	Map    string `json:"map"`
+	// The configured settings.
+	D          float64 `json:"d"`
+	PixTh      float64 `json:"pix_th"`
+	PicTh      float64 `json:"pic_th"`
+	TriggerMin float64 `json:"trigger_min"`
+	// FFmpegD is the d ffmpeg is given: every run is reported, and the
+	// monitor applies d to whole runs.
+	FFmpegD float64 `json:"ffmpeg_d"`
+	// MaxJoinGapS is the most time with no frame a run may span at a
+	// segment boundary; EdgeToleranceFrames how close to a segment's
+	// first or last frame a run must be to join across it.
+	MaxJoinGapS         float64 `json:"max_join_gap_s"`
+	EdgeToleranceFrames float64 `json:"edge_tolerance_frames"`
+	// FallbackFrameTicks is the frame duration used when neither the
+	// master playlist nor the segments give one.
+	FallbackFrameTicks int64   `json:"fallback_frame_ticks"`
+	Workers            int     `json:"workers"`
+	TimeoutS           float64 `json:"timeout_s"`
+	AllowOpenH264      bool    `json:"allow_openh264"`
+	// ColorRange is the channel's color_range: limited, full, or as
+	// signaled.
+	ColorRange string `json:"color_range"`
 }
 
 // EvidenceFile is one file in an incident directory.
@@ -54,14 +93,24 @@ type EvidenceFile struct {
 }
 
 // BlackRun is one black run in one segment: seconds from the segment's
-// first frame, and PTS.
+// first frame, and PTS, with its black frames and the rest of its time on
+// screen (see BlackInterval).
 type BlackRun struct {
-	Seq      uint64  `json:"seq"`
-	Start    float64 `json:"start_s"`
-	End      float64 `json:"end_s"`
-	Duration float64 `json:"duration_s"`
-	StartPTS uint64  `json:"start_pts,omitzero"`
-	EndPTS   uint64  `json:"end_pts,omitzero"`
+	Seq             uint64  `json:"seq"`
+	Start           float64 `json:"start_s"`
+	End             float64 `json:"end_s"`
+	Duration        float64 `json:"duration_s"`
+	StartPTS        uint64  `json:"start_pts,omitzero"`
+	EndPTS          uint64  `json:"end_pts,omitzero"`
+	BlackFrames     int     `json:"black_frames"`
+	BlackFramesS    float64 `json:"black_frames_s"`
+	UndecodedFrames int     `json:"undecoded_frames,omitzero"`
+	NoFrameS        float64 `json:"no_frame_s"`
+	// Unconfirmed: its segment was not fully checked.
+	Unconfirmed bool `json:"unconfirmed,omitzero"`
+	// PixFmt and ColorRange are what blackdetect judged its frames in.
+	PixFmt     string `json:"pix_fmt,omitempty"`
+	ColorRange string `json:"color_range,omitempty"`
 }
 
 // StreamInfo identifies what was being monitored.
@@ -156,6 +205,7 @@ type RenditionSegment struct {
 	Fetch         *FetchMeta        `json:"fetch,omitempty"`
 	Analysis      *analysis.Summary `json:"analysis,omitempty"`
 	Black         []BlackInterval   `json:"black_intervals,omitempty"`
+	BlackDecode   *BlackDecode      `json:"black_decode,omitempty"`
 	Faults        []string          `json:"faults,omitempty"`
 	// Unchecked lists fault types that could not be checked on this
 	// segment, e.g. because it was not usable TS or ffmpeg failed.

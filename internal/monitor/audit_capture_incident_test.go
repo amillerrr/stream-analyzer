@@ -149,7 +149,7 @@ func TestAuditStorageCapDeletesNonIncidentDirectories(t *testing.T) {
 	cfg.IncidentStorageBytes = 1500
 	m := newTestMonitor(t, cfg, nil)
 	root := filepath.Join(cfg.DataDir, "incidents")
-	for _, name := range []string{"2026-vendor-copies", "20260929T142601Z_channel6"} {
+	for _, name := range []string{"2026-shared-copies", "20260102T030405Z_channel6"} {
 		os.MkdirAll(filepath.Join(root, name), 0o755)
 		os.WriteFile(filepath.Join(root, name, "seg_1.ts"), make([]byte, 1000), 0o644)
 	}
@@ -159,7 +159,7 @@ func TestAuditStorageCapDeletesNonIncidentDirectories(t *testing.T) {
 		left = append(left, filepath.Base(d))
 	}
 	t.Logf("left: %v", left)
-	if !slices.Contains(left, "2026-vendor-copies") {
+	if !slices.Contains(left, "2026-shared-copies") {
 		t.Errorf("a non-incident directory was deleted by the storage cap")
 	}
 }

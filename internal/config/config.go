@@ -52,9 +52,12 @@ type Config struct {
 type Blackdetect struct {
 	Enabled bool
 	Workers int // concurrent ffmpeg processes across all channels
-	// TriggerMin is the shortest black run, in seconds, that opens an
+	// TriggerMin is the black frames, in seconds, a run needs to open an
 	// incident on its own. Shorter runs down to d are still recorded.
 	TriggerMin float64
+	// AllowOpenH264 lets the monitor start with an ffmpeg that decodes
+	// H.264 only with OpenH264. The self-test must still pass.
+	AllowOpenH264 bool
 	blackdetect.Options
 }
 
@@ -63,6 +66,9 @@ type Channel struct {
 	Name      string
 	URL       string
 	Rendition string // overrides Config.Rendition when set
+	// ColorRange forces the range black is judged in: "limited" or
+	// "full"; "" takes what the stream signals.
+	ColorRange string
 }
 
 // Default returns the defaults, with no channels.
@@ -157,6 +163,7 @@ func Parse(data []byte) (Config, error) {
 	bd.float("pic_th", &c.Blackdetect.PictureThreshold)
 	bd.float("trigger_min", &c.Blackdetect.TriggerMin)
 	bd.str("ffmpeg", &c.Blackdetect.FFmpeg)
+	bd.bool("allow_openh264", &c.Blackdetect.AllowOpenH264)
 	bd.int("workers", &c.Blackdetect.Workers)
 	bd.dur("timeout", &c.Blackdetect.Timeout)
 	bd.checkUnknown()
@@ -173,6 +180,7 @@ func Parse(data []byte) (Config, error) {
 		cs.str("name", &ch.Name)
 		cs.str("url", &ch.URL)
 		cs.str("rendition", &ch.Rendition)
+		cs.str("color_range", &ch.ColorRange)
 		cs.checkUnknown()
 		c.Channels = append(c.Channels, ch)
 	}
@@ -184,6 +192,12 @@ func Parse(data []byte) (Config, error) {
 	}
 	return c, nil
 }
+
+// The black thresholds' bounds (see validate).
+const (
+	MaxPixelThreshold   = 0.2 // pix_th
+	MinPictureThreshold = 0.8 // pic_th
+)
 
 var safeName = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 
@@ -282,6 +296,9 @@ func (c Config) validate() []error {
 		if err := checkSelector(ch.Rendition); err != nil {
 			fail(key+".rendition", "%v", err)
 		}
+		if ch.ColorRange != "" && !slices.Contains(blackdetect.Ranges, ch.ColorRange) {
+			fail(key+".color_range", "must be limited or full (or left out to take what the stream signals), got %q", ch.ColorRange)
+		}
 		switch u, err := url.Parse(ch.URL); {
 		case ch.URL == "":
 			fail(key+".url", "required")
@@ -372,11 +389,16 @@ func (c Config) validate() []error {
 	if !(b.TriggerMin >= b.Duration && b.TriggerMin <= 3600) {
 		fail("blackdetect.trigger_min", "must be between d (%g) and 3600 seconds, got %g", b.Duration, b.TriggerMin)
 	}
-	if b.PixelThreshold < 0 || b.PixelThreshold > 1 {
-		fail("blackdetect.pix_th", "must be between 0 and 1")
-	}
-	if b.PictureThreshold < 0 || b.PictureThreshold > 1 {
-		fail("blackdetect.pic_th", "must be between 0 and 1")
+	// Outside these bounds ordinary pictures count as black: at pic_th 0.5
+	// a windowboxed one, at pix_th 0.3 a dark but visible one.
+	switch {
+	case b.PixelThreshold > b.PictureThreshold && b.PixelThreshold > MaxPixelThreshold && b.PictureThreshold < MinPictureThreshold:
+		fail("blackdetect.pix_th", "%g and pic_th %g look swapped: pix_th is the darkest a pixel may be to count as black (at most %g), pic_th the share of such pixels a black picture needs (at least %g)",
+			b.PixelThreshold, b.PictureThreshold, MaxPixelThreshold, MinPictureThreshold)
+	case !(b.PixelThreshold >= 0 && b.PixelThreshold <= MaxPixelThreshold):
+		fail("blackdetect.pix_th", "must be between 0 and %g, got %g: above it, dark but visible pictures count as black", MaxPixelThreshold, b.PixelThreshold)
+	case !(b.PictureThreshold >= MinPictureThreshold && b.PictureThreshold <= 1):
+		fail("blackdetect.pic_th", "must be between %g and 1, got %g: below it, pictures with black bars count as black", MinPictureThreshold, b.PictureThreshold)
 	}
 	if b.Workers < 1 || b.Workers > 64 {
 		fail("blackdetect.workers", "must be between 1 and 64, got %d", b.Workers)

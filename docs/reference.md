@@ -40,8 +40,11 @@ it is only run read-only, for `blackdetect` on the saved files.
 `caffeinate -i` stops a Mac from idle-sleeping while the monitor runs;
 `caffeinate -s` also prevents system sleep on AC power.
 
-The monitor logs to the terminal and to `data/stream-analyzer.log`, and
-appends every health line to `data/health.csv`. Stop it with Ctrl-C,
+The monitor logs to the terminal and to `data/stream-analyzer.log`, every
+time in UTC: each line's own, any time in its values, and lines from Go's
+standard library (such as the capture listener's errors), which go
+through the same logger. It appends every health line to
+`data/health.csv`. Stop it with Ctrl-C,
 SIGTERM or by closing the terminal (SIGHUP): open incidents are closed
 (reason `shutdown`) and indexed before it exits. A closed terminal or a
 broken pipe on stderr doesn't stop it: the log file still gets every line,
@@ -73,7 +76,7 @@ Every setting except `channels` is optional.
 | `log_file` | `stream-analyzer.log` | inside `data_dir` (it can't leave it or name one of the monitor's own files); an absolute path; or `""` = stderr only |
 | `user_agent` | `stream-analyzer/1.0` | sent on every request; no control characters |
 | `tls_max_version` | `"1.2"` | the highest TLS version offered, `"1.2"` or `"1.3"` (see [Stream notes](#stream-notes)) |
-| `rendition` | `highest` | for master playlists: `highest`, `lowest`, a 0-based index, `WxH`, or a URI substring. Channels can override it. |
+| `rendition` | `highest` | for master playlists: `highest`, `lowest`, a 0-based index, `WxH`, or a URI substring. `highest` and `lowest` skip audio-only variants (`CODECS` with no video codec and no `RESOLUTION`); with nothing else, the channel doesn't resolve. Channels can override it. |
 | `buffer` | `3m` | rolling evidence per channel (10 s to 1 h) |
 | `post_roll` | `60s` | keep recording after the last fault |
 | `merge_window` | `60s` | faults this close together share one incident |
@@ -91,14 +94,22 @@ Every setting except `channels` is optional.
 | `checks.av_rebaseline_after` | `10` | a sustained new offset becomes the baseline after this many segments (0 = never) |
 | `checks.duration_tolerance_pct` | `10` | real duration vs EXTINF |
 | `blackdetect.enabled` | `true` | run ffmpeg blackdetect on every segment |
-| `blackdetect.d` / `pix_th` / `pic_th` | `0.1` / `0.10` / `0.98` | ffmpeg blackdetect parameters: every run of `d` or longer is recorded |
-| `blackdetect.trigger_min` | `1.0` | shortest black run (seconds) that opens an incident by itself |
-| `blackdetect.ffmpeg` | `ffmpeg` | the ffmpeg to run: a name on `PATH` or a full path |
+| `blackdetect.d` / `pix_th` / `pic_th` | `0.1` / `0.10` / `0.98` | ffmpeg blackdetect parameters: every run of `d` or longer is recorded. `pix_th` must be 0 to 0.2 and `pic_th` 0.8 to 1: outside those, ordinary pictures count as black (see the README) |
+| `blackdetect.trigger_min` | `1.0` | the black frames (seconds of them) a run needs to open an incident by itself |
+| `blackdetect.ffmpeg` | `ffmpeg` | the ffmpeg to run: a name on `PATH` or a full path. It is resolved once, at start, and that binary runs every check (see [ffmpeg at start](#ffmpeg-at-start)) |
+| `blackdetect.allow_openh264` | `false` | start with an ffmpeg whose only H.264 decoder is OpenH264; the self-test must still pass |
 | `blackdetect.workers` | `4` | concurrent ffmpeg processes across all channels |
 | `blackdetect.timeout` | `30s` | per ffmpeg run |
 
 Each channel has a `name`, a `url` and, optionally, a `rendition` that
-overrides the top-level one.
+overrides the top-level one, and a `color_range`: `limited` or `full` reads
+the channel's luma in that range for black, whatever the stream signals;
+left out, the stream's signal decides (untagged is limited). Use it for a
+stream that is full range but doesn't say so, whose dark pictures would
+otherwise count as black. Forcing a range decodes 10-bit video at 8 bits.
+Every black run, `black_decode` and `black_video` fault records the
+`pix_fmt` and `color_range` blackdetect judged the frames in, and
+`report.json`'s `blackdetect.color_range` the channel's setting.
 
 Unknown keys are errors, so a typo can't silently leave a default in place.
 So is a value outside a range where the setting still does its job (a
@@ -107,6 +118,44 @@ directory names: letters, digits, `.`, `_` and `-`, and they must differ in
 more than case (on macOS's file system two names that differ only in case
 are one directory). A channel URL can't carry `user:password@`, which would
 be copied into every evidence file.
+
+## ffmpeg at start
+
+With `blackdetect.enabled` on, the monitor (and `reanalyze`) checks ffmpeg
+before anything else, and doesn't start if a check fails:
+
+1. `blackdetect.ffmpeg` is looked up once and resolved to the binary itself
+   (symbolic links followed). Every ffmpeg run uses that path, so a change
+   to `PATH`, a package upgrade or a moved link can't swap in another build
+   unchecked; if the file goes away, runs fail as `blackdetect_errors`.
+2. `ffmpeg -version` and `ffmpeg -decoders` give the version and the
+   decoders ffmpeg uses for H.264 and HEVC (the first one listed for the
+   codec that isn't experimental). A build with no H.264 decoder is
+   refused, and so is one whose only H.264 decoder is OpenH264
+   (`libopenh264`, as in EPEL's `ffmpeg-free`) unless
+   `blackdetect.allow_openh264` is on: OpenH264 drops full-range video's
+   range tag, so dark pictures count as black, mis-times frames on
+   irregular segments, and can't decode interlaced, 10-bit or 4:2:2 video.
+3. A self-test runs blackdetect exactly as the monitor does, with ffmpeg's
+   default thresholds (0.10, 0.98), on three small H.264 clips built into
+   the binary (made from ffmpeg's lavfi sources): limited range with
+   B-frames and a black run across the 33-bit PTS wrap, beside dark frames
+   that aren't black; full range with black frames and dark frames (luma 30
+   of 255) that aren't; and a file with two video PIDs, the picture on one
+   and black on the other, decoded once each. Every frame must be decoded,
+   with no decode error, at the PTS the clip carries, and exactly the black
+   frames must be black. Any other answer stops the monitor and names the
+   clip and frame. With the OpenH264 builds tested (ffmpeg 7.1.5,
+   `openh264` 2.3.1) the full-range clip's dark frames come out black, so
+   `allow_openh264` alone doesn't get such a build past it.
+4. The log gets one line with the resolved path, the version, both
+   decoders and the self-test's result, and a warning when ffmpeg is older
+   than 7.0 or its version can't be read (a build from git).
+
+```
+level=INFO msg=ffmpeg path=/usr/bin/ffmpeg configured=ffmpeg version=7.1.5 h264_decoder=h264 hevc_decoder=hevc
+  self_test=passed self_test_decoder="h264 (native)" allow_openh264=false
+```
 
 ## What happens per channel
 
@@ -125,30 +174,40 @@ be copied into every evidence file.
    doesn't decode is kept as sent, as `.m3u8.gz`.
 3. It checks the playlist against the previous one (see
    [Playlist checks](#playlist-checks-and-origin-notes)) and downloads each
-   new segment raw, once per URI (`seg_<N>.ts`), then checks it and writes
-   `seg_<N>.json`: playlist entry, fetch metadata, timing summary, black runs
-   and faults. The first playlist queues its last 3 segments.
+   new segment raw, once per URI (`seg_<N>_<hash>.ts`), then checks it and
+   writes `seg_<N>_<hash>.json`: playlist entry, fetch metadata, timing
+   summary, black runs and faults. The first playlist queues its last 3 segments.
    - Any refusal (a 4xx or 5xx) is retried once after 1 s. If the retry works
      it's counted as `origin_errors_recovered` in the health line.
    - Our own network errors are retried twice with backoff (0.5 s, then 1 s).
    - Every attempt is kept: the failed ones in `failed_attempts`, each with
-     its own headers, and each refusal's body as `seg_<N>.attempt<K>.body`.
+     its own headers, and each refusal's body as
+     `seg_<N>_<hash>.attempt<K>.body`.
 4. It keeps the last 3 minutes of all of this in `data/buffer/<channel>/`. It
    also keeps the 3 minutes before the last segment, so a long stall can't
    prune away what came before it. A segment's files, and a playlist
    fetch's, are pruned together. At start it prunes what an earlier run
    left, so an incident's pre-roll is never another run's.
 
-Segments are known by the origin's number. Some origins name segments
-`...-seq=N.ts`; `N` identifies the segment: its file is `seg_N.ts` and its
-record's `seq` is `N`. The playlist position (`EXT-X-MEDIA-SEQUENCE` plus
-its index) is kept as `msn`: an origin that renumbers its playlist moves a
-listed segment to another position, so a position can name two segments
-over time. A segment is compared with the entry the playlist lists right
-before it (`prev_seq`, `prev_uri`); numbers the origin skips are not
-monitor gaps. Other renditions' segments are matched by the same number,
-and checked to start at the same media time (within 0.5 s). A URI without
-`seq=N` is known by its position.
+A segment is known by its URI. Its number `N` (its record's `seq`) is the
+packager's own, from a `seq=N` in the URI's file name (`...-seq=N.ts`), or
+else its playlist position (`EXT-X-MEDIA-SEQUENCE` plus its index). A
+`seq=` elsewhere in the URI, such as a token in the query, is not a
+number. Numbers are each packager's convention, and HLS doesn't require
+them to be unique: an inserted ad break may number its segments from 1, or
+have none and take positions that content numbers also use. So a
+segment's files are named by its number and the first 8 hex digits of its
+URI's SHA-256 (`seg_<N>_<hash>`), its record in a report is its number and
+URI, and a repeated number is no fault; a playlist that still lists the
+newest segment queued is never taken for a stale copy, whatever its
+numbers. Numbers order segments, count monitor gaps and match other
+renditions. The position is kept as `msn`: an origin that renumbers its
+playlist moves a listed segment to another position, so a position can
+name two segments over time. A segment is compared with the entry the
+playlist lists right before it (`prev_seq`, `prev_uri`); numbers the origin
+skips are not monitor gaps. Other renditions' segments are matched by the
+same number, and checked to start at the same media time (within 0.5 s).
+`reanalyze` reads incidents saved with the earlier names, `seg_<N>.ts`, too.
 
 Relative URIs resolve against the URL a playlist was actually served from,
 after any redirects, as a player's would. The fetch metadata records it as
@@ -183,7 +242,8 @@ frame rate don't change it.
 | `pts_pcr_jump` | PTS−PCR changed by more than `pcr_jump_ms` between consecutive frames, within a segment or across the boundary |
 | `av_offset` | the segment's A/V start offset (min video PTS − min audio PTS) is more than `av_offset_ms` from the channel baseline |
 | `duration_mismatch` | real duration (video DTS span + one frame, or the audio span when there is no video) differs from EXTINF by more than `duration_tolerance_pct` |
-| `black_video` | a black run of at least `trigger_min` (1 s) on screen, joined across segment boundaries. It reports the black frames and the time with no frame at all separately (see below). |
+| `black_video` | a black run with at least `trigger_min` (1 s) of black frames ffmpeg decoded, joined across segment boundaries. Time with no frame at all, and frames ffmpeg could not decode, are reported with it but never count (see below). |
+| `undecoded_frames` | ffmpeg did not decode frames the TS parser found, after the first frame it did decode: the black check could not see them. Frames dropped before the first decodable one are not this fault (see below). |
 | `invalid_segment` | a 200 response that isn't usable MPEG-TS, such as an HTML error page; its `Content-Type` and `Content-Encoding` are in the values |
 | `ts_corruption` | bytes that were not TS packets (sync lost) or packets flagged `transport_error_indicator` were skipped; the counts are in the values |
 | `discontinuity` | a new segment carries `EXT-X-DISCONTINUITY` |
@@ -215,18 +275,65 @@ frame rate don't change it.
   the usual post-roll, so the resumption is recorded too. A stall that
   outlasted its incident gets a short incident of its own for its end
   (`stall_ended`).
-- **Black runs.** ffmpeg (with `-copyts`) reports every black run, and each
-  is placed in the segment's PTS. A run that reaches the end of one segment
-  and continues within half a frame at the start of the next, or after
-  frames missing altogether for at most 0.5 s, counts as one run. Every run
-  of `d` (0.1 s) or longer is recorded in the segment's JSON and in the
-  `black_runs` list of any report covering it; only a run of `trigger_min`
-  (1 s) or longer opens an incident by itself. The length is the time on
-  screen: ffmpeg counts time with no frame at all as black (the last frame
-  stays on screen), so each run and each fault gives its black frames
-  (`black_frames`, `black_frames_s`) and that time (`no_frame_s`)
-  separately. Where an encoder drops frames during black, the no-frame time
-  was 34 to 47 % of a run.
+- **Black runs.** ffmpeg (with `-copyts`) decodes only the video stream the
+  TS parser analyzed (`-map 0:i:0x<PID>`): the first program's video PID
+  with the lowest number. A segment with a second video stream or a second
+  program can't have the other one judged instead, and a PID the file
+  doesn't carry fails the run. ffmpeg prints every frame it decodes with
+  its PTS in 90 kHz ticks and blackdetect's mark for it, and a run is placed
+  on its frames' own PTS, each matched to the parser's frame with that PTS.
+  So ffmpeg's rounding (before 7.0 it prints times to 6 significant digits,
+  a frame off at large PTS) and its unwrapping of timestamps near the 33-bit
+  wrap (negative times when a file starts in the last minute before it)
+  don't move a run, and a run that lasts to the end of a segment is told
+  from one that ends a frame before it.
+
+  A run is the black frames ffmpeg output one after another, and it ends
+  one frame after the last of them. A run's length is its black frames'
+  time on screen (`black_frames_s`, each frame shown until the next, one
+  frame at most): ffmpeg's own runs last until the next frame it decodes,
+  so they also hold time with no frame at all and frames it could not
+  decode, and neither is black. Each run also gives its time on screen
+  (`duration_s`), the frames inside it that ffmpeg did not decode
+  (`undecoded_frames`) and the time with no frame (`no_frame_s`), which the
+  timing checks report on their own (`frame_gap`, `video_dts_gap`).
+
+  A run that reaches the end of one segment and continues within half a
+  frame at the start of the next, or after frames missing altogether for at
+  most 0.5 s, counts as one run. Every run with `d` (0.1 s) or more of black
+  frames is recorded in the segment's JSON and in the `black_runs` list of
+  any report covering it; only a run with `trigger_min` (1 s) of black
+  frames opens an incident by itself. Where an encoder drops frames during
+  black, the time with no frame was 34 to 47 % of a run's time on screen.
+- **Decoded frames.** Each segment's record has `black_decode`: the frames
+  the parser found, the frames ffmpeg decoded, the frames dropped before
+  the first one ffmpeg could decode (`leading_dropped`: expected for a
+  segment decoded on its own that has an open GOP or doesn't start on an
+  IDR), and the frames not decoded after that (`undecoded`, with where they
+  are). Those raise `undecoded_frames`. Frames are missing only when
+  ffmpeg output fewer frames than the parser found; pairing each decoded
+  frame with a parser frame within half a frame of its PTS says which.
+  ffmpeg re-times frames that share or jitter their PTS, so a frame with no
+  decoded frame at its own PTS was not necessarily lost.
+- **Not checked.** A segment's black check is incomplete when ffmpeg
+  decoded no frame, or after its first frame left frames undecoded or
+  logged decode errors (ffmpeg exits 0 unless more than 2/3 of the frames
+  fail, so its exit status alone says little). Frames dropped before the
+  first decodable one, and errors logged while ffmpeg looked for it, are
+  expected and don't count. So does output ffmpeg printed that can't be
+  read with certainty: a blackdetect line that isn't a black run, a time
+  that isn't a finite number, a run that ends before it starts or whose
+  duration isn't the time between its ends, a frame with no timestamp, or
+  printed runs the frames' marks don't show (times are compared to the
+  digits ffmpeg printed). Then nothing from that run of ffmpeg is used.
+  `black_decode.not_checked` says why, the
+  segment counts in `black_not_checked`, and black found in it is kept but
+  marked `unconfirmed`, in the segment's runs, in `black_runs` and in a
+  `black_video` fault. With `blackdetect.enabled` on, a segment with no
+  video stream or no saved file is not checked either. Another
+  rendition's segment that wasn't fully checked reproduces a black fault
+  when it shows enough black frames, and is `inconclusive` when it
+  doesn't.
 - **PTS order.** Each segment's pictures are checked for PTS before DTS (a
   fault) and for two pictures due in one frame slot (`duplicate_pts`, an
   event). At a boundary, presentation is compared as well as decoding.
@@ -253,11 +360,11 @@ the reason in its values and both playlists' files named:
 | reason | meaning |
 |---|---|
 | `renumbered` | a listed segment moved to another position (the origin moved `EXT-X-MEDIA-SEQUENCE` further than the segments that left) |
-| `skipped_number` | a new entry's `seq=N` is not one more than the entry before it |
-| `rewritten_entry` | an entry already listed changed its URI, EXTINF or tags (other than the first entry's cue tags; see below) |
+| `skipped_number` | a new entry's `seq=N` is more than one past the entry before it, in the same directory: numbers that packager never used. A number that repeats or goes back, or one in another directory (an inserted ad), is not |
+| `rewritten_entry` | an entry already listed changed its EXTINF or tags (other than the first entry's cue tags; see below), or a new URI is listed at a position (media sequence number) an old URI had, when the playlist wasn't renumbered |
 | `discontinuity_sequence` | `EXT-X-DISCONTINUITY-SEQUENCE` changed by something other than the discontinuities that left the playlist |
 | `discontinuity_tag_dropped` | `EXT-X-DISCONTINUITY` was removed from a listed segment while `EXT-X-DISCONTINUITY-SEQUENCE` is sent but not incremented |
-| `window_jump` | the playlist moved past numbers it never listed, faster than the origin could have produced them |
+| `window_jump` | the playlist moved past numbers it never listed, faster than the origin could have produced them (judged only when the two ends' numbers are one packager's) |
 
 Some origins break these rules routinely. These are origin notes, not
 faults:
@@ -372,9 +479,10 @@ buffer can change it.
     whichever is more; for `duration_mismatch`, 1 percentage point or a
     tenth).
   - `different`: the same type of fault but another size, or, for black, an
-    overlapping run shorter than `trigger_min`.
+    overlapping run with less than `trigger_min` of black frames.
   - `not_reproduced`, with what the rendition measured there.
-  - `inconclusive`: the check couldn't run there (ffmpeg failed, the bytes
+  - `inconclusive`: the check couldn't run there (ffmpeg failed or, for
+    black, didn't fully decode the segment and found too little black; the bytes
     weren't TS), or the rendition lists another segment before this one.
   - `incomplete`: the segment before it is missing.
   - The segment's status: `pending`, `failed` (the last attempt failed;
@@ -396,7 +504,25 @@ buffer can change it.
   - the fault types and count, and the sequence numbers;
   - each fault with its segment's URI and its timestamp values (raw 33-bit
     ticks and milliseconds);
-  - every black run in the covered segments (`black_runs`);
+  - every black run in the covered segments (`black_runs`), with its black
+    frames (`black_frames`, `black_frames_s`), undecoded frames and time
+    with no frame (`no_frame_s`);
+  - for each `black_video` fault, `values.thumbnails` names a strip in
+    `thumbnails/`, `black_<N>_<hash>.png`: 160x90 tiles of the frame decoded
+    before the run, its first, middle and last black frames, and the frame
+    decoded after it, each taken by its PTS from the segment that holds it
+    (one ffmpeg run, on a worker slot). The `.json` beside it gives each
+    tile's role, segment file and PTS; a run that lasts to the end of its
+    segment has no "after" tile yet (`continues`), and a tile whose segment
+    file is gone is listed under `missing`. Reanalyze makes none;
+  - `blackdetect`: how black was checked. The ffmpeg found at start (its
+    resolved path, version, H.264 and HEVC decoders and the self-test's
+    decoder), the decoders the listed segments went through
+    (`decoders_used`), the filter graph and stream ffmpeg ran, the
+    configured `d`, `pix_th`, `pic_th` and `trigger_min`, and the fixed
+    values: the `d` given to ffmpeg (0), the 0.5 s join gap, the half-frame
+    edge tolerance, the 29.97 fps fallback frame, the workers, the timeout
+    and `allow_openh264`. `report.v2.json` has the reanalysis's;
   - the discontinuity and SCTE-35 tags present;
   - `origin_notes`: the origin notes seen while it was open, and in its
     pre-roll (`pre_roll: true`);
@@ -450,17 +576,18 @@ health line every minute, plus a last one (marked `final=true`) for the part
 of a minute before the monitor stops. A line is `WARN` if fetches failed,
 the channel is stalled, nothing arrived (except in the final line), or
 anything stopped the monitor collecting evidence or checking the stream:
-a file it couldn't write, a blackdetect failure, a segment dropped from a
-full queue, a monitor gap, a channel URL it couldn't load, a recovered
+a file it couldn't write, a blackdetect failure, a segment whose black
+check was incomplete or skipped, a segment dropped from a full queue, a monitor gap, a channel URL it couldn't load, a recovered
 panic, or free space under `min_free_gb`. The same values are appended to
 `data/health.csv`:
 
 ```
-level=INFO msg=health channel=channel1 rendition=3_1280x720_4500000 seq=61770362 segments=10 mb=28.6
+level=INFO msg=health channel=channel1 rendition=3_1280x720_4500000 seq=1204 segments=10 mb=28.6
   playlists=17 playlist_errors=0 stale_playlists=0 segment_errors=0 origin_errors_recovered=0 monitor_gaps=0
-  faults=0 suppressed=0 target_duration_changes=0 short_black_runs=0 frame_gaps=0 audio_retimed=6 last_new_segment_age=1.2s
-  av_offset_ms=-10.644 av_baseline_ms=-7.3 min_pts_pcr_ms=42.2 min_dts_pcr_ms=8.9 write_errors=0
-  blackdetect_errors=0 queue_drops=0 resolve_errors=0 panics=0 last_processed_age=2.1s free_gb=812.4 incident=none
+  faults=0 suppressed=0 target_duration_changes=0 short_black_runs=0 leading_frames_dropped=0 frame_gaps=0
+  audio_retimed=6 last_new_segment_age=1.2s av_offset_ms=-10.644 av_baseline_ms=-7.3 min_pts_pcr_ms=42.2
+  min_dts_pcr_ms=8.9 write_errors=0 blackdetect_errors=0 black_not_checked=0 queue_drops=0 resolve_errors=0
+  panics=0 last_processed_age=2.1s free_gb=812.4 incident=none
 ```
 
 The timing columns are logged only; there is no alert on them.
@@ -469,9 +596,19 @@ The timing columns are logged only; there is no alert on them.
   DTS−PCR over the minute, at each frame's first packet. A frame without a
   DTS uses its PTS. A mux that stamps the PCR at DTS − 8.9 ms shows 8.9 here
   on every line.
-- `short_black_runs` counts the black runs that ended in the minute without
-  reaching `trigger_min`. A run split across segments is counted once, when
-  it ends.
+- `short_black_runs` counts the black runs that ended in the minute with at
+  least `d` but less than `trigger_min` of black frames. A run split across
+  segments is counted once, when it ends.
+- `leading_frames_dropped` counts the frames ffmpeg dropped before the first
+  one it could decode in each segment: an open GOP, or a segment that
+  doesn't start on an IDR, decoded on its own. They are expected, are not
+  black, and don't make the line a warning.
+- `black_not_checked` counts the segments whose black check was incomplete:
+  ffmpeg decoded no frame, or after its first frame it left frames
+  undecoded or logged decode errors. It also counts segments with no check
+  at all while `blackdetect.enabled` is on: no video stream, or a file that
+  couldn't be saved. Any of them makes the line a warning. Black found in
+  such a segment is still recorded, marked `unconfirmed`.
 - `frame_gaps` and `audio_retimed` count the minute's skipped frame slots
   and segments with re-timed audio (see
   [Irregular segments](#irregular-segments-eventscsv)).
@@ -487,9 +624,10 @@ The timing columns are logged only; there is no alert on them.
 - `segments`, `mb`, `playlists`, `playlist_errors`, `stale_playlists`,
   `segment_errors`, `origin_errors_recovered`, `monitor_gaps`
 - `faults`, `suppressed`, `target_duration_changes`, `short_black_runs`,
-  `frame_gaps`, `audio_retimed`, `stalled`, `last_new_segment_age_s`
+  `leading_frames_dropped`, `frame_gaps`, `audio_retimed`, `stalled`,
+  `last_new_segment_age_s`
 - `av_offset_ms`, `av_baseline_ms`, `min_pts_pcr_ms`, `min_dts_pcr_ms`
-- `write_errors`, `blackdetect_errors`, `queue_drops`, `resolve_errors`,
+- `write_errors`, `blackdetect_errors`, `black_not_checked`, `queue_drops`, `resolve_errors`,
   `panics`, `last_processed_age_s`, `free_gb`, `incident`
 
 If an existing `health.csv`, `events.csv` or `scte35.csv` has other columns
@@ -630,7 +768,7 @@ Notes:
 ## stream-analyzer reanalyze
 
 ```sh
-./stream-analyzer reanalyze -config channels.yaml data/incidents/20261001T120000Z_channel1
+./stream-analyzer reanalyze -config channels.yaml data/incidents/20260105T120000Z_channel1
 ```
 
 This runs the current checks again on incidents already saved, with the
@@ -695,22 +833,32 @@ some of the defaults.
   minutes of normal programming on ten channels. A monitor that numbers
   segments by playlist position downloads a segment twice after such a
   renumbering and reports a 2 to 6 s timestamp jump that isn't in the
-  stream, which is why segments are known by their URI number.
+  stream, which is why segments are known by their URI, not their
+  position.
 - **Black video.** At `d=0.1` blackdetect also finds the fades to black
   inside programming, such as trailer cuts of about 0.5 s. That's why only
-  runs of `trigger_min` (1 s) or longer open incidents; the short ones are
-  still recorded. The encoder dropped frames during black, so black
-  segments held fewer frames than usual, with holes of up to 2 s between
-  them.
+  runs with `trigger_min` (1 s) of black frames open incidents; the short
+  ones are still recorded. The encoder dropped frames during black, so
+  black segments held fewer frames than usual, with holes of up to 2 s
+  between them: that time with no frame is not counted as black.
 
 ## Limitations in detail
 
 - **Segment formats.** Only whole, clear MPEG-TS segments are supported. A
   playlist with `EXT-X-KEY` (other than `METHOD=NONE`), `EXT-X-MAP` or
-  `EXT-X-BYTERANGE` is refused, with the reason, as a failed fetch.
+  `EXT-X-BYTERANGE` is refused, with the reason, as a failed fetch. So is a
+  master playlist with `EXT-X-SESSION-KEY` (other than `METHOD=NONE`): it
+  applies to every variant, and the channel URL then never resolves
+  (`resolve_errors` in the health line).
   Low-latency parts (`EXT-X-PART`) are ignored, as a client that doesn't
   play low-latency may; the full segments are checked. `EXT-X-GAP` segments
   are not fetched (`gap_tagged`).
+- **Field-coded video.** The black check compares the frames ffmpeg
+  decoded with the parser's, which counts one frame per video PES. A
+  field-coded (PAFF) H.264 stream that carries each field in a PES of its
+  own would show half its frames as undecoded (`undecoded_frames`, not
+  checked). None of the streams this was tested against is field-coded,
+  and none could be generated to test it.
 - **Alternate audio.** Only audio muxed into the segments is checked;
   `EXT-X-MEDIA` renditions are not fetched.
 - **Log size.** The log is not rotated; it grows by a few MB a day.
@@ -754,9 +902,23 @@ The tests cover:
   - TS parsing: PES without timestamps, split PES headers, lost sync, TEI
     packets, non-AAC audio, and fuzzing.
 - **hls:** the update rules (renumbering, skipped numbers, target duration,
-  rewritten entries, discontinuity sequence and dropped tags); truncated
-  and garbage playlists; unsupported tags; the SCTE-35 tag types; and, when
-  `data/` is there, every saved playlist.
+  rewritten entries, discontinuity sequence and dropped tags); segment
+  keys unique when numbers repeat, with no violation for a repeat;
+  truncated and garbage playlists; unsupported tags, `EXT-X-SESSION-KEY`
+  included; audio-only variants skipped by `highest` and `lowest`; the
+  SCTE-35 tag types.
+- **blackdetect**, against the ffmpeg on `PATH` and against fake or
+  wrapped ffmpegs:
+  - every decoded frame with its exact PTS and mark, only the given PID
+    decoded, decode errors before and after the first frame, the decoder,
+    pixel format and color range, and a forced range;
+  - output that can't be read with certainty is an error: odd black lines,
+    frames with no timestamp, runs the frames don't show; ffmpeg 5.1's
+    coarse times and negative times near the wrap are read;
+  - the version and decoder lists, the OpenH264 refusal, the binary
+    resolved once, and the self-test, which passes on this ffmpeg and
+    fails on a build that decodes the other video stream, loses the
+    full-range tag or shifts timestamps.
 - **monitor, end to end against a local HTTP origin:**
   - Segments known by the origin's number through a renumbering: each URI
     fetched once, no false jump, renditions compared at the same numbers.
@@ -778,12 +940,25 @@ The tests cover:
     resumes; `EXT-X-ENDLIST` is `stream_ended`, not a stall.
   - Black runs from real ffmpeg output joined across segments, and short
     runs at a boundary; black frames and missing frames apart.
+  - The false-black cases (generated with ffmpeg at test time): another
+    video stream in the file, a run near the 33-bit wrap, undecodable
+    frames after black, a PTS jump after black, segments ffmpeg decodes
+    nothing from or logs errors on, and thresholds that make pictures
+    black. Only decoded black frames count; leading drops are expected;
+    re-timed frames are not missing; skipped checks are not checked; the
+    same rules in other renditions and in `reanalyze`; a channel's
+    `color_range`; a thumbnail strip with every black fault; every
+    `report.json` saying how black was checked.
+  - Two segments with one number keep their own files and records; lower
+    numbers after the newest segment queued are new, and a window jump
+    needs one packager's numbers.
   - Irregular segments go to `events.csv` with their SCTE-35 flag, tag
     type, frame counts and gap sizes, and are counted in `health.csv`,
     without an incident.
   - Tagged segments go to `scte35.csv` with their tag type and EXTINF.
   - Failures make the health line a warning: unwritable files, ffmpeg
-    failures, queue drops, unresolvable channels, panics, low disk.
+    failures, segments not fully checked, queue drops, unresolvable
+    channels, panics, low disk; dropped leading frames don't.
   - The capture endpoint refuses non-loopback hosts and web pages.
   - Headers saved as sent, over plain HTTP and TLS; gzip playlists that
     don't decode kept as sent; segments never decoded.
@@ -805,7 +980,9 @@ The tests cover:
   - incident edges: sidecars of segments checked as it closes;
   - stall-safe buffer pruning;
   - health minima, `health.csv`, including rotating an old layout;
-  - crash recovery; config ranges and validation;
+  - crash recovery; config ranges and validation, the black thresholds'
+    bounds and `color_range` included; the startup ffmpeg check, its
+    refusal and its log line; every log time in UTC;
   - the `TestAudit*` tests, which reproduce specific failure cases.
 
 Regenerate the fixtures after changing the generator:
@@ -813,6 +990,16 @@ Regenerate the fixtures after changing the generator:
 ```sh
 go test ./internal/tstest -run TestFixturesUpToDate -update
 ```
+
+The self-test's clips in `internal/blackdetect/selftest/` are made from
+lavfi sources with libx264; make them again with:
+
+```sh
+go test ./internal/blackdetect -run TestSelfTestClips -update
+```
+
+Tests that need ffmpeg, or one of its encoders (`mpeg2video`, `mp2`,
+`libx264`), skip without it.
 
 ## Code layout
 
@@ -824,7 +1011,7 @@ internal/yamlite        the YAML subset parser (stdlib only)
 internal/hls            master/media playlists, update rules, variant selection, SCTE-35 tags
 internal/ts             TS packets, PES headers, PAT/PMT (from ts-validator), 33-bit clock math
 internal/analysis       per-segment timing extraction and the checks
-internal/blackdetect    ffmpeg blackdetect runner
+internal/blackdetect    ffmpeg blackdetect runner, startup checks, self-test and its clips
 internal/monitor        polling, buffer, incidents, renditions, CSV, cap, HTTP trigger, health, reanalyze
 internal/report         the report subcommand: splice points, irregular segments, breaks, faults
 internal/tstest         synthetic TS builder and fixtures

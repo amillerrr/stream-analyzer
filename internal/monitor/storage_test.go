@@ -74,14 +74,14 @@ func TestBufferIsPrunedAtStart(t *testing.T) {
 // the time it was handled, not at year 1.
 func TestUnfetchedSegmentIsLoggedNow(t *testing.T) {
 	cfg := testConfig(t, "http://127.0.0.1:1/never.m3u8")
-	at := time.Date(2026, 9, 30, 18, 0, 0, 0, time.UTC)
+	at := time.Date(2026, 1, 3, 18, 0, 0, 0, time.UTC)
 	c := newTestMonitor(t, cfg, func() time.Time { return at }).channels[0]
 	c.logEvents(SegmentRecord{Seq: 5, SCTE35: []string{"#EXT-X-CUE-IN"}})
 	b, err := os.ReadFile(filepath.Join(cfg.DataDir, "scte35.csv"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(b), "2026-09-30T18:00:00.000Z,test,5,") {
+	if !strings.Contains(string(b), "2026-01-03T18:00:00.000Z,test,5,") {
 		t.Errorf("scte35.csv:\n%s", b)
 	}
 }

@@ -109,9 +109,9 @@ func TestRefusedSegmentAttemptsAreKept(t *testing.T) {
 func TestBufferGroupsAFetchsFiles(t *testing.T) {
 	for _, set := range [][]string{
 		{"seg_501.ts", "seg_501.json", "seg_501.attempt1.body", "seg_501.attempt2.body"},
-		{"playlist_20260929T144854.849Z_msn5.m3u8", "playlist_20260929T144854.849Z_msn5.json"},
-		{"playlist_20260929T144854.849Z_msn5.m3u8.gz", "playlist_20260929T144854.849Z_msn5.json"},
-		{"playlist_20260929T144854.849Z.json"},
+		{"playlist_20260102T144854.849Z_msn5.m3u8", "playlist_20260102T144854.849Z_msn5.json"},
+		{"playlist_20260102T144854.849Z_msn5.m3u8.gz", "playlist_20260102T144854.849Z_msn5.json"},
+		{"playlist_20260102T144854.849Z.json"},
 	} {
 		for _, name := range set[1:] {
 			if fileGroup(name) != fileGroup(set[0]) {
@@ -119,7 +119,7 @@ func TestBufferGroupsAFetchsFiles(t *testing.T) {
 			}
 		}
 	}
-	if fileGroup("seg_501.ts") == fileGroup("seg_5010.ts") || fileGroup("playlist_20260929T144854.849Z_msn5.json") == fileGroup("playlist_20260929T144854.851Z_msn5.json") {
+	if fileGroup("seg_501.ts") == fileGroup("seg_5010.ts") || fileGroup("playlist_20260102T144854.849Z_msn5.json") == fileGroup("playlist_20260102T144854.851Z_msn5.json") {
 		t.Error("different fetches share a group")
 	}
 }

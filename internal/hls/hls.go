@@ -4,10 +4,13 @@ package hls
 
 import (
 	"cmp"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"math"
 	"net/url"
+	"path"
 	"regexp"
 	"slices"
 	"strconv"
@@ -37,16 +40,35 @@ func (v Variant) FrameTicks() int64 {
 
 // Label identifies the variant in file names: index_resolution_bandwidth.
 // RESOLUTION comes from the origin, so only WxH digits are used as they
-// are; anything else is "unknown", and no label can hold a path.
+// are. A variant whose CODECS list no video codec is "audio"; any other
+// without a usable RESOLUTION is "unknown", and no label can hold a path.
 func (v Variant) Label() string {
-	res := "audio"
+	res := "unknown"
 	switch {
 	case resolution.MatchString(v.Resolution):
 		res = v.Resolution
-	case v.Resolution != "":
-		res = "unknown"
+	case v.AudioOnly():
+		res = "audio"
 	}
 	return fmt.Sprintf("%d_%s_%d", v.Index, res, v.Bandwidth)
+}
+
+// videoCodecs are the CODECS prefixes of video formats (RFC 6381).
+var videoCodecs = []string{"avc1", "avc2", "avc3", "avc4", "hvc1", "hev1", "dvh1", "dvhe", "dva1", "dvav", "av01", "vp08", "vp09", "mp4v", "mp2v"}
+
+// AudioOnly reports a variant whose CODECS attribute lists codecs, none of
+// them video, and that has no RESOLUTION. Without CODECS it can't be told.
+func (v Variant) AudioOnly() bool {
+	if v.Resolution != "" || strings.TrimSpace(v.Codecs) == "" {
+		return false
+	}
+	for c := range strings.SplitSeq(v.Codecs, ",") {
+		name, _, _ := strings.Cut(strings.TrimSpace(c), ".")
+		if slices.Contains(videoCodecs, strings.ToLower(name)) {
+			return false
+		}
+	}
+	return true
 }
 
 var resolution = regexp.MustCompile(`^[0-9]{1,5}x[0-9]{1,5}$`)
@@ -75,10 +97,9 @@ type Media struct {
 type Segment struct {
 	// Seq is the segment's position: EXT-X-MEDIA-SEQUENCE plus its index.
 	Seq uint64
-	// URISeq is the origin's own number for the segment, from a "seq=N" in
-	// its URI (the origin names segments ...-seq=N.ts). It stays
-	// with the segment when the origin renumbers its playlist, which the
-	// position does not.
+	// URISeq is the packager's own number for the segment, from a "seq=N"
+	// in its file name (...-seq=N.ts). It stays with the segment when the
+	// origin renumbers its playlist, which the position does not.
 	URISeq          uint64
 	HasURISeq       bool
 	URI             string
@@ -225,6 +246,10 @@ func ParseMaster(data []byte) (*Master, error) {
 	var m Master
 	var pending *Variant
 	for _, line := range ls {
+		if rest, ok := strings.CutPrefix(line, "#EXT-X-SESSION-KEY:"); ok && parseAttrs(rest)["METHOD"] != "NONE" {
+			// It applies to every variant, as EXT-X-KEY does to one.
+			return nil, fmt.Errorf("encrypted segments are not supported (%s): the monitor reads clear MPEG-TS", line)
+		}
 		if rest, ok := strings.CutPrefix(line, "#EXT-X-STREAM-INF:"); ok {
 			a := parseAttrs(rest)
 			bw, _ := strconv.Atoi(a["BANDWIDTH"])
@@ -372,8 +397,10 @@ func ParseMedia(data []byte) (*Media, error) {
 	return &p, nil
 }
 
-// Number identifies a segment: the origin's number from its URI when it
-// has one, otherwise its playlist position.
+// Number is a segment's number: its packager's number from its file name
+// when it has one, otherwise its playlist position. It orders segments and
+// matches them across renditions, but it is a convention, not an identity:
+// HLS doesn't require it to be unique. Key identifies the segment.
 func (s Segment) Number() uint64 {
 	if s.HasURISeq {
 		return s.URISeq
@@ -381,16 +408,50 @@ func (s Segment) Number() uint64 {
 	return s.Seq
 }
 
-var uriSeq = regexp.MustCompile(`(?:^|[-_/?&])seq=(\d+)`)
+// Key identifies a segment by its number and a hash of its URI, so two
+// segments with one number are still told apart: "1204_3fa2b1c0".
+func (s Segment) Key() string { return SegmentKey(s.Number(), s.URI) }
 
-// URINumber returns the origin's number in a "seq=N" part of a segment URI.
+// SegmentKey is Key for a segment with number n and URI uri.
+func SegmentKey(n uint64, uri string) string { return fmt.Sprintf("%d_%s", n, URIHash(uri)) }
+
+// URIHash is the first 8 hex digits of the URI's SHA-256.
+func URIHash(uri string) string {
+	sum := sha256.Sum256([]byte(uri))
+	return hex.EncodeToString(sum[:4])
+}
+
+var uriSeq = regexp.MustCompile(`(?:^|[-_.])seq=(\d+)`)
+
+// URINumber returns the packager's number in a "seq=N" part of a segment
+// URI's file name (...-seq=N.ts). A seq= in its directories or query, such
+// as a session token, is not a segment number.
 func URINumber(uri string) (uint64, bool) {
-	m := uriSeq.FindStringSubmatch(uri)
+	m := uriSeq.FindStringSubmatch(fileName(uri))
 	if m == nil {
 		return 0, false
 	}
 	n, err := strconv.ParseUint(m[1], 10, 64)
 	return n, err == nil
+}
+
+// fileName is the last element of a URI's path, without query or fragment.
+func fileName(uri string) string {
+	uri, _, _ = strings.Cut(uri, "#")
+	uri, _, _ = strings.Cut(uri, "?")
+	return path.Base(uri)
+}
+
+// Dir is a URI without its file name, query and fragment: segments in one
+// directory come from one packager and share its numbering.
+func Dir(uri string) string {
+	uri, _, _ = strings.Cut(uri, "#")
+	uri, _, _ = strings.Cut(uri, "?")
+	d, _, _ := strings.CutLast(uri, "/")
+	if !strings.Contains(uri, "/") {
+		return ""
+	}
+	return d
 }
 
 // parseSeconds parses a duration in seconds: finite and not negative, so
@@ -404,8 +465,9 @@ func parseSeconds(s string) (float64, error) {
 }
 
 // SelectVariant picks the variant to monitor: "highest" (default) or
-// "lowest" bandwidth, a 0-based index, a WxH resolution, or a substring of
-// the variant URI. Several matches resolve to the highest bandwidth.
+// "lowest" bandwidth among those that aren't audio only, a 0-based index,
+// a WxH resolution, or a substring of the variant URI. Several matches
+// resolve to the highest bandwidth.
 func SelectVariant(vs []Variant, sel string) (Variant, error) {
 	if len(vs) == 0 {
 		return Variant{}, errors.New("no variants")
@@ -413,10 +475,15 @@ func SelectVariant(vs []Variant, sel string) (Variant, error) {
 	byBandwidth := func(a, b Variant) int { return cmp.Compare(a.Bandwidth, b.Bandwidth) }
 	sel = strings.TrimSpace(sel)
 	switch strings.ToLower(sel) {
-	case "", "highest":
-		return slices.MaxFunc(vs, byBandwidth), nil
-	case "lowest":
-		return slices.MinFunc(vs, byBandwidth), nil
+	case "", "highest", "lowest":
+		video := slices.DeleteFunc(slices.Clone(vs), Variant.AudioOnly)
+		switch {
+		case len(video) == 0:
+			return Variant{}, errors.New("every variant is audio only (CODECS lists no video codec): there is no picture to check")
+		case strings.ToLower(sel) == "lowest":
+			return slices.MinFunc(video, byBandwidth), nil
+		}
+		return slices.MaxFunc(video, byBandwidth), nil
 	}
 	if n, err := strconv.Atoi(sel); err == nil {
 		if n < 0 || n >= len(vs) {

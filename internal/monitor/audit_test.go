@@ -1,6 +1,6 @@
 package monitor
 
-// Audit (2026-09-30): regression tests for five ways the monitor went
+// Audit: regression tests for five ways the monitor went
 // wrong. The comment above each test describes the failure, and the test
 // fails if it comes back: a renumbered playlist reported as a timestamp
 // jump, rendition files written outside the incident, blackdetect
@@ -29,9 +29,8 @@ import (
 	"github.com/amillerrr/stream-analyzer/internal/tstest"
 )
 
-// renumberingOrigin serves two renditions whose playlists do what the
-// origin did on 2026-09-29 (incidents 20260929T175600Z_channel2,
-// 20260929T145203Z_channel2 and others): segment number 102 is skipped, so
+// renumberingOrigin serves two renditions whose playlists do what an
+// origin was seen to do: segment number 102 is skipped, so
 // the segment named 103 sits at position 102, and a later playlist starts
 // at EXT-X-MEDIA-SEQUENCE 103 with that same segment, renumbering every
 // segment after it by one. The media itself is continuous: file uN holds

@@ -48,7 +48,7 @@ func TestIncidentFilesAreCopies(t *testing.T) {
 }
 
 // A closed incident's report.json lists every evidence file in it, with its
-// size and SHA-256, so a copy sent to a vendor can be checked.
+// size and SHA-256, so a copy sent elsewhere can be checked.
 func TestReportListsEveryEvidenceFileWithItsSHA256(t *testing.T) {
 	cfg := testConfig(t, "http://127.0.0.1:1/never.m3u8")
 	m := newTestMonitor(t, cfg, nil)

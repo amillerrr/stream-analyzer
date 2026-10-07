@@ -1,8 +1,7 @@
 package analysis
 
-// Audit (2026-09-30): 33-bit wraparound on real segments. The monitor has
-// never seen a real wrap (the one on 2026-09-30 came at about 13:10 UTC, three
-// minutes after it stopped), and the committed fixtures are synthetic. This
+// Audit: 33-bit wraparound on real segments. A wrap comes about once every
+// 26.5 hours, and the committed fixtures are synthetic. This
 // test takes consecutive real segments, adds a constant to every PTS, DTS and
 // PCR base (modulo 2^33) so that the wrap falls inside a segment or exactly
 // on a boundary, and checks that every check gives the same result as on

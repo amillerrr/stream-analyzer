@@ -45,6 +45,8 @@ type rendition struct {
 	// blackMin is blackdetect's trigger_min: the shortest black run that is
 	// a black_video fault.
 	blackMin float64
+	// colorRange is the channel's color_range.
+	colorRange string
 
 	// Guarded by incidents.mu.
 	segs        map[uint64]*RenditionSegment
@@ -69,10 +71,13 @@ const maxListings = 5000
 // blackRun is a black run in PTS, joined across a rendition's adjacent
 // segments.
 type blackRun struct {
-	start, end uint64
-	seconds    float64 // on screen
-	frames     int     // black frames
-	segs       []uint64
+	start, end  uint64
+	seconds     float64 // on screen
+	frames      int     // black frames
+	blackS      float64 // their time on screen
+	undecoded   int     // frames inside it ffmpeg did not decode
+	unconfirmed bool    // part of it is in a segment not fully checked
+	segs        []uint64
 }
 
 type renditionData struct {
@@ -83,7 +88,10 @@ type renditionData struct {
 	// right before this one, when it lists one.
 	prev     *uint64
 	black    []BlackInterval
+	decode   BlackDecode
 	blackErr error
+	// notChecked says why the black check was incomplete or skipped.
+	notChecked string
 }
 
 // expire marks a wanted segment that left the playlist before it could be
@@ -101,7 +109,7 @@ var contentFaults = []string{
 	analysis.FaultVideoDTSGap, analysis.FaultAudioPTSGap, analysis.FaultVideoDTSNotIncreasing,
 	analysis.FaultPTSBehindPCR, analysis.FaultPTSPCRJump, analysis.FaultAVOffset,
 	analysis.FaultDurationMismatch, analysis.FaultBlackVideo, analysis.FaultAudioCoverage,
-	analysis.FaultVideoPTSError, analysis.FaultVideoPTSGap,
+	analysis.FaultVideoPTSError, analysis.FaultVideoPTSGap, analysis.FaultUndecodedFrames,
 }
 
 func (r *rendition) want(seqs []uint64) {
@@ -254,13 +262,13 @@ func (in *incidents) fetchRenditionSegment(ctx context.Context, inc *incident, r
 		})
 		return
 	}
-	file := fmt.Sprintf("seg_%d.ts", num)
+	file := segmentFile(num, e.URI) + ".ts"
 	path := filepath.Join(r.dir, file)
 	if err := writeFileAtomic(path, body); err != nil {
 		inc.ch.writeFailed("cannot save rendition segment", path, err)
 		file = ""
 	}
-	if err := writeJSON(filepath.Join(r.dir, fmt.Sprintf("seg_%d.json", num)), meta); err != nil {
+	if err := writeJSON(filepath.Join(r.dir, segmentFile(num, e.URI)+".json"), meta); err != nil {
 		inc.ch.writeFailed("cannot save rendition segment metadata", path, err)
 	}
 	f := in.m.checkRenditionSegment(ctx, r, e, prev, file, path, meta, body)
@@ -275,14 +283,16 @@ func (in *incidents) fetchRenditionSegment(ctx context.Context, inc *incident, r
 
 // renditionFetch is one segment fetched from another rendition, checked.
 type renditionFetch struct {
-	entry    hls.Segment // its entry in the rendition's playlist
-	prev     *uint64     // the number of the entry listed before it
-	file     string      // its file in the rendition directory; "" if not saved
-	meta     FetchMeta
-	seg      *analysis.Segment
-	err      error // why the bytes are not usable TS
-	black    []BlackInterval
-	blackErr error
+	entry      hls.Segment // its entry in the rendition's playlist
+	prev       *uint64     // the number of the entry listed before it
+	file       string      // its file in the rendition directory; "" if not saved
+	meta       FetchMeta
+	seg        *analysis.Segment
+	err        error // why the bytes are not usable TS
+	black      []BlackInterval
+	decode     BlackDecode
+	blackErr   error
+	notChecked string // why the black check was incomplete or skipped
 }
 
 // checkRenditionSegment analyzes a rendition's segment and runs blackdetect
@@ -291,11 +301,17 @@ func (m *Monitor) checkRenditionSegment(ctx context.Context, r *rendition, e hls
 	f := renditionFetch{entry: e, prev: prev, file: file, meta: meta}
 	f.seg, f.err = analysis.Analyze(body)
 	switch {
-	case f.err != nil || f.seg.Video == nil || !m.cfg.Blackdetect.Enabled:
+	case f.err != nil || !m.cfg.Blackdetect.Enabled:
+	case f.seg.Video == nil:
+		f.notChecked = blackSkipped(f.seg, file)
 	case file == "":
 		f.blackErr = errors.New("the segment could not be saved for ffmpeg")
 	default:
-		f.black, f.blackErr = m.blackRuns(ctx, path, f.seg, cmp.Or(r.variant.FrameTicks(), f.seg.Video.FrameTicks))
+		res, err := m.blackRuns(ctx, path, f.seg, cmp.Or(r.variant.FrameTicks(), f.seg.Video.FrameTicks), r.colorRange)
+		if nc, ok := errors.AsType[*notCheckedError](err); ok {
+			f.notChecked, err = nc.why, nil
+		}
+		f.black, f.decode, f.blackErr = res.runs, res.decode, err
 	}
 	return f
 }
@@ -312,6 +328,13 @@ func (inc *incident) addRenditionSegment(r *rendition, f renditionFetch) {
 	}
 	seg := f.seg
 	s.Status, s.URI, s.File, s.Fetch, s.Black, s.Error = statusFetched, f.entry.URI, f.file, &f.meta, f.black, ""
+	s.BlackDecode = nil
+	switch {
+	case f.blackErr == nil && f.seg != nil && f.seg.Video != nil && f.decode.Frames > 0:
+		s.BlackDecode = new(f.decode)
+	case f.notChecked != "":
+		s.BlackDecode = &BlackDecode{NotChecked: f.notChecked}
+	}
 	switch {
 	case f.err != nil:
 		s.Error = f.err.Error()
@@ -333,7 +356,10 @@ func (inc *incident) addRenditionSegment(r *rendition, f renditionFetch) {
 			}
 		}
 	}
-	r.data[num] = renditionData{seg: seg, extinf: f.entry.Duration, disc: f.entry.Discontinuity, prev: f.prev, black: f.black, blackErr: f.blackErr}
+	r.data[num] = renditionData{
+		seg: seg, extinf: f.entry.Duration, disc: f.entry.Discontinuity, prev: f.prev,
+		black: f.black, decode: f.decode, blackErr: f.blackErr, notChecked: f.notChecked,
+	}
 }
 
 // mediaOffset is how far this rendition's copy of segment num starts from
@@ -491,21 +517,32 @@ func (r *rendition) blackVerdict(f FaultRecord) (string, map[string]any) {
 	for i := range r.runs {
 		run := &r.runs[i]
 		overlaps := ts.Diff(run.start, uint64(end)) < 0 && ts.Diff(uint64(start), run.end) < 0
-		if overlaps && (best == nil || run.seconds > best.seconds) {
+		if overlaps && (best == nil || run.blackS > best.blackS) {
 			best = run
 		}
 	}
+	unchecked := r.data[f.Seq].notChecked != ""
 	if best == nil {
+		if unchecked {
+			return "inconclusive", nil // not finding black there proves nothing
+		}
 		return "not_reproduced", nil
 	}
-	frame := cmp.Or(r.variant.FrameTicks(), 3003)
+	frame := cmp.Or(r.variant.FrameTicks(), fallbackFrameTicks)
 	values := map[string]any{
 		"longest_run_s": round3(best.seconds), "run_start_pts": best.start, "run_end_pts": best.end,
-		"black_frames": best.frames, "no_frame_s": round3(noFrame(best.seconds, best.frames, frame)),
-		"segments": best.segs,
+		"black_frames": best.frames, "black_frames_s": round3(best.blackS), "undecoded_frames": best.undecoded,
+		"no_frame_s": round3(noFrame(best.seconds, best.blackS, best.undecoded, frame)),
+		"segments":   best.segs,
 	}
-	if best.seconds >= r.blackMin {
+	if best.unconfirmed {
+		values["unconfirmed"] = true
+	}
+	switch {
+	case best.blackS >= r.blackMin:
 		return "reproduced", values
+	case unchecked:
+		return "inconclusive", values
 	}
 	return "different", values
 }
@@ -617,6 +654,9 @@ func (r *rendition) recheck(th analysis.Thresholds, baseline *int64) {
 				"offset_ms": round3(ts.Millis(off)), "baseline_ms": round3(ts.Millis(*baseline)), "deviation_ms": round3(ts.Millis(off - *baseline)),
 			}})
 		}
+		if d.blackErr == nil && d.decode.Undecoded > 0 {
+			faults = append(faults, undecodedFault(seq, d.decode))
+		}
 		r.faults[seq] = faults
 		if d.blackErr != nil {
 			unchecked = append(unchecked, analysis.FaultBlackVideo)
@@ -631,7 +671,7 @@ func (r *rendition) recheck(th analysis.Thresholds, baseline *int64) {
 		for _, f := range r.faults[seq] {
 			types = append(types, f.Type)
 		}
-		if slices.ContainsFunc(r.runs, func(b blackRun) bool { return b.seconds >= r.blackMin && slices.Contains(b.segs, seq) }) {
+		if slices.ContainsFunc(r.runs, func(b blackRun) bool { return b.blackS >= r.blackMin && slices.Contains(b.segs, seq) }) {
 			types = append(types, analysis.FaultBlackVideo)
 		}
 		r.segs[seq].Faults = types
@@ -643,7 +683,7 @@ func (r *rendition) recheck(th analysis.Thresholds, baseline *int64) {
 // and joinsBlack says it goes on. It returns the run that lasts to this
 // segment's end, or -1.
 func (r *rendition) addBlack(seq uint64, black []BlackInterval, adjacent bool, open int) int {
-	frame := cmp.Or(r.variant.FrameTicks(), 3003)
+	frame := cmp.Or(r.variant.FrameTicks(), fallbackFrameTicks)
 	ends := -1
 	for i, b := range black {
 		var at int
@@ -651,9 +691,14 @@ func (r *rendition) addBlack(seq uint64, black []BlackInterval, adjacent bool, o
 			at = open
 			run := &r.runs[at]
 			run.end, run.frames, run.segs = b.EndPTS, run.frames+b.Frames, append(run.segs, seq)
+			run.blackS, run.undecoded = run.blackS+b.BlackS, run.undecoded+b.UndecodedFrames
+			run.unconfirmed = run.unconfirmed || b.Unconfirmed
 			run.seconds = float64(ts.Diff(run.end, run.start)) / ts.Hz
 		} else {
-			r.runs = append(r.runs, blackRun{start: b.StartPTS, end: b.EndPTS, seconds: b.Duration, frames: b.Frames, segs: []uint64{seq}})
+			r.runs = append(r.runs, blackRun{
+				start: b.StartPTS, end: b.EndPTS, seconds: b.Duration, frames: b.Frames,
+				blackS: b.BlackS, undecoded: b.UndecodedFrames, unconfirmed: b.Unconfirmed, segs: []uint64{seq},
+			})
 			at = len(r.runs) - 1
 		}
 		if b.ToEnd {

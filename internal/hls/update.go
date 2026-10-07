@@ -141,16 +141,19 @@ func renumbered(prev, cur *Media, old map[string]int) (Violation, bool) {
 	}, true
 }
 
-// skippedNumbers reports new entries whose URI number is not one more than
-// the entry listed before them. Entries in old were checked when they were
-// new.
+// skippedNumbers reports new entries whose URI number is more than one
+// past the entry listed before them, in the same directory: numbers that
+// packager never used. Numbers are each packager's own convention, and
+// HLS doesn't require them to be unique, so a number that repeats or goes
+// back, or one from another directory (an inserted ad), is no violation.
+// Entries in old were checked when they were new.
 func skippedNumbers(cur *Media, old map[string]int) (Violation, bool) {
 	var v Violation
 	var skips []map[string]any
 	var parts []string
 	for i := 1; i < len(cur.Segments); i++ {
 		a, b := &cur.Segments[i-1], &cur.Segments[i]
-		if _, known := old[b.URI]; known || !a.HasURISeq || !b.HasURISeq || b.URISeq == a.URISeq+1 {
+		if _, known := old[b.URI]; known || !a.HasURISeq || !b.HasURISeq || b.URISeq <= a.URISeq+1 || Dir(a.URI) != Dir(b.URI) {
 			continue
 		}
 		if len(skips) == 0 {
@@ -160,8 +163,6 @@ func skippedNumbers(cur *Media, old map[string]int) (Violation, bool) {
 			skips = append(skips, map[string]any{"after": a.URISeq, "seq": b.URISeq, "uri": b.URI})
 		}
 		switch {
-		case b.URISeq <= a.URISeq:
-			parts = append(parts, fmt.Sprintf("seq=%d follows seq=%d: the numbers went back", b.URISeq, a.URISeq))
 		case b.URISeq == a.URISeq+2:
 			parts = append(parts, fmt.Sprintf("number %d was never used: seq=%d follows seq=%d", a.URISeq+1, b.URISeq, a.URISeq))
 		default:
@@ -198,20 +199,21 @@ func targetChange(prev, cur *Media) Violation {
 }
 
 // rewritten reports entries already listed whose EXTINF or tags changed,
-// and new URIs listed under a number an old URI had. A dropped
-// EXT-X-DISCONTINUITY is left to discontinuityChanges (a gained one is a
-// rewrite), and the cue tags of the entry that became first to
-// firstEntryCues.
-// Positions are only compared when the playlist was not renumbered.
+// and new URIs listed at a position (media sequence number) an old URI
+// had. A dropped EXT-X-DISCONTINUITY is left to discontinuityChanges (a
+// gained one is a rewrite), and the cue tags of the entry that became
+// first to firstEntryCues. Positions are only compared when the playlist
+// was not renumbered; numbers in URIs never are, since they need not be
+// unique.
 func rewritten(prev, cur *Media, old map[string]int, renumbered bool) (Violation, bool) {
 	listed := make(map[string]bool, len(cur.Segments))
 	for _, s := range cur.Segments {
 		listed[s.URI] = true
 	}
-	byNum := make(map[uint64]*Segment, len(prev.Segments))
+	byPos := make(map[uint64]*Segment, len(prev.Segments))
 	for i := range prev.Segments {
-		if s := &prev.Segments[i]; s.HasURISeq || !renumbered {
-			byNum[s.Number()] = s
+		if !renumbered {
+			byPos[prev.Segments[i].Seq] = &prev.Segments[i]
 		}
 	}
 	var entries []map[string]any
@@ -239,7 +241,7 @@ func rewritten(prev, cur *Media, old map[string]int, renumbered bool) (Violation
 			for _, t := range added {
 				what = append(what, "gained "+t)
 			}
-		} else if p, ok := byNum[s.Number()]; ok && p.HasURISeq == s.HasURISeq && !listed[p.URI] {
+		} else if p, ok := byPos[s.Seq]; ok && !listed[p.URI] {
 			what = append(what, fmt.Sprintf("URI %s -> %s", p.URI, s.URI))
 		}
 		if len(what) == 0 {

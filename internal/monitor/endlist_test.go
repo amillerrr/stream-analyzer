@@ -22,7 +22,7 @@ func TestEndlistEndsTheStreamNotAStall(t *testing.T) {
 	}
 	live := parse(playlistBody(100, -1, seg(100), seg(101), seg(102)))
 	ended := parse(append(playlistBody(100, -1, seg(100), seg(101), seg(102)), "#EXT-X-ENDLIST\n"...))
-	at := time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC)
+	at := time.Date(2026, 1, 3, 12, 0, 0, 0, time.UTC)
 	meta := FetchMeta{Status: 200}
 	var p pollState
 	p.update(live, "http://h/p.m3u8", "p1", meta, at, 3)

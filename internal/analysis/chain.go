@@ -44,6 +44,12 @@ const (
 	// FaultPlaylistViolation is a playlist update that breaks the rules for
 	// a live playlist; Values["reason"] says how (see hls.CheckUpdate).
 	FaultPlaylistViolation = "playlist_violation"
+	// FaultUndecodedFrames: ffmpeg did not decode frames the TS parser
+	// found, after the first frame it did decode, so the black check could
+	// not see them. Frames dropped before the first decodable one (an
+	// open GOP, or no IDR at the segment's start) are expected when a
+	// segment is decoded on its own, and are not this fault.
+	FaultUndecodedFrames = "undecoded_frames"
 )
 
 // Fault is one detected problem in one segment. Values holds the timestamp

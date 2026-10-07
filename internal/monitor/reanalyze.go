@@ -53,7 +53,12 @@ func Reanalyze(ctx context.Context, dir string, o Options) (Report, error) {
 	if err != nil {
 		return Report{}, err
 	}
-	o.Config.Channels = []config.Channel{{Name: old.Channel, URL: old.Stream.URL}}
+	// The incident's channel, with its color_range when the config has it.
+	ch := config.Channel{Name: old.Channel, URL: old.Stream.URL}
+	if i := slices.IndexFunc(o.Config.Channels, func(c config.Channel) bool { return c.Name == old.Channel }); i >= 0 {
+		ch.ColorRange = o.Config.Channels[i].ColorRange
+	}
+	o.Config.Channels = []config.Channel{ch}
 	o.Config.DataDir = dir
 	m, err := New(o)
 	if err != nil {
@@ -72,6 +77,7 @@ func Reanalyze(ctx context.Context, dir string, o Options) (Report, error) {
 		report: Report{
 			ID: old.ID, Channel: old.Channel, Status: old.Status, OpenedAt: old.OpenedAt.UTC(),
 			ClosedAt: old.ClosedAt.UTC(), CloseReason: old.CloseReason, Stream: old.Stream,
+			Blackdetect: m.blackdetectInfo(ch.ColorRange),
 		},
 	}
 	var fetchedAt map[uint64]time.Time
@@ -100,6 +106,9 @@ func Reanalyze(ctx context.Context, dir string, o Options) (Report, error) {
 	}
 	if n := c.st.blackErrors; n > 0 {
 		rp.notes = append(rp.notes, fmt.Sprintf("blackdetect failed on %d segments: black runs through them are not checked", n))
+	}
+	if n := c.st.blackNotChecked; n > 0 {
+		rp.notes = append(rp.notes, fmt.Sprintf("black was not fully checked on %d segment(s): their records' black_decode says why, and black found in them is unconfirmed", n))
 	}
 	inc.notes = rp.notes
 	inc.refresh()
@@ -263,7 +272,10 @@ type savedSegment struct {
 	rec  *SegmentRecord // its record; nil when none was saved
 }
 
-var segFile = regexp.MustCompile(`^seg_(\d+)\.(ts|json)$`)
+// segFile matches a segment's file: seg_<number>_<hash of its URI>, or
+// seg_<number> as earlier versions named them. Group 1 is the number,
+// group 3 the extension.
+var segFile = regexp.MustCompile(`^seg_(\d+)(_[0-9a-f]{8})?\.(ts|json)$`)
 
 // loadSegments finds each saved segment by its URI. Its record (the .json
 // sidecar) names the URI. Before the origin's numbers were used, files were
@@ -293,7 +305,7 @@ func loadSegments(dir string, fetches []savedFetch) (segs map[string]*savedSegme
 		switch {
 		case m == nil:
 			continue
-		case m[2] == "ts":
+		case m[3] == "ts":
 			files[e.Name()] = true
 			continue
 		}
@@ -342,8 +354,9 @@ func loadSegments(dir string, fetches []savedFetch) (segs map[string]*savedSegme
 		if used[file] {
 			continue
 		}
-		n, _ := strconv.ParseUint(segFile.FindStringSubmatch(file)[1], 10, 64)
-		uri, from := listedAs(fetches, n, byPosition)
+		m := segFile.FindStringSubmatch(file)
+		n, _ := strconv.ParseUint(m[1], 10, 64)
+		uri, from := listedAs(fetches, n, strings.TrimPrefix(m[2], "_"), byPosition)
 		switch _, dup := out[uri]; {
 		case uri == "":
 			notes = append(notes, file+" has no record and no saved playlist lists it; it is not reanalyzed")
@@ -358,13 +371,17 @@ func loadSegments(dir string, fetches []savedFetch) (segs map[string]*savedSegme
 }
 
 // listedAs finds the URI of number n in the first saved playlist that lists
-// it: the entry at position n, or with origin number n.
-func listedAs(fetches []savedFetch, n uint64, byPosition bool) (uri, playlist string) {
+// it: the entry at position n, or with origin number n, and when hash
+// isn't "" (a file named by number and URI hash) the URI with that hash.
+func listedAs(fetches []savedFetch, n uint64, hash string, byPosition bool) (uri, playlist string) {
 	for _, f := range fetches {
 		if f.pl == nil {
 			continue
 		}
 		for _, s := range f.pl.Segments {
+			if hash != "" && hls.URIHash(s.URI) != hash {
+				continue
+			}
 			if byPosition && s.Seq == n || !byPosition && s.Number() == n {
 				return s.URI, f.name + ".m3u8"
 			}
@@ -601,7 +618,8 @@ func (rp *replay) renditions(old Report) error {
 		}
 		r := &rendition{
 			variant: v, dir: filepath.Join(root, d.Name()), blackMin: cfg.Blackdetect.TriggerMin,
-			segs: map[uint64]*RenditionSegment{}, data: map[uint64]renditionData{},
+			colorRange: rp.c.cfg.ColorRange,
+			segs:       map[uint64]*RenditionSegment{}, data: map[uint64]renditionData{},
 		}
 		if i := slices.IndexFunc(old.Renditions, func(o RenditionReport) bool { return o.Label == d.Name() }); i >= 0 {
 			r.url = old.Renditions[i].PlaylistURL
@@ -655,7 +673,7 @@ func (rp *replay) rendition(r *rendition) error {
 	var saved []fetched
 	for _, e := range files {
 		m := segFile.FindStringSubmatch(e.Name())
-		if m == nil || m[2] != "json" {
+		if m == nil || m[3] != "json" {
 			continue
 		}
 		b, err := os.ReadFile(filepath.Join(r.dir, e.Name()))

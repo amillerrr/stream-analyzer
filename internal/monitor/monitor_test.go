@@ -254,7 +254,10 @@ func TestSkippedSegmentIsAMonitorGapNotAnIncident(t *testing.T) {
 	}
 
 	buf := filepath.Join(cfg.DataDir, "buffer", "test")
-	for _, name := range []string{"seg_100.ts", "seg_100.json", "seg_101.json", "seg_102.ts"} {
+	for _, name := range []string{
+		segmentFile(100, "s100.ts") + ".ts", segmentFile(100, "s100.ts") + ".json",
+		segmentFile(101, "s101.ts") + ".json", segmentFile(102, "s102.ts") + ".ts",
+	} {
 		if _, err := os.Stat(filepath.Join(buf, name)); err != nil {
 			t.Errorf("buffer: %v", err)
 		}
@@ -338,16 +341,16 @@ func TestTimestampJumpOpensIncidentWithEvidence(t *testing.T) {
 	}
 
 	for name, want := range map[string][]byte{
-		"segments/seg_200.ts":                    before,
-		"segments/seg_201.ts":                    after,
-		"renditions/1_640x360_500000/seg_201.ts": after,
-		"renditions/1_640x360_500000/seg_200.ts": before,
+		"segments/" + segmentFile(200, "hi200.ts") + ".ts":                    before,
+		"segments/" + segmentFile(201, "hi201.ts") + ".ts":                    after,
+		"renditions/1_640x360_500000/" + segmentFile(201, "lo201.ts") + ".ts": after,
+		"renditions/1_640x360_500000/" + segmentFile(200, "lo200.ts") + ".ts": before,
 	} {
 		if got, err := os.ReadFile(filepath.Join(dir, name)); err != nil || !bytes.Equal(got, want) {
 			t.Errorf("%s: %d bytes, %v", name, len(got), err)
 		}
 	}
-	for _, pattern := range []string{"playlists/playlist_*.m3u8", "playlists/playlist_*.json", "playlists/master_*.m3u8", "segments/seg_201.json"} {
+	for _, pattern := range []string{"playlists/playlist_*.m3u8", "playlists/playlist_*.json", "playlists/master_*.m3u8", "segments/" + segmentFile(201, "hi201.ts") + ".json"} {
 		if m, _ := filepath.Glob(filepath.Join(dir, pattern)); len(m) == 0 {
 			t.Errorf("no %s in the incident", pattern)
 		}

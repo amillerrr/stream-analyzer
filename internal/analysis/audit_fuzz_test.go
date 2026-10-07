@@ -1,6 +1,6 @@
 package analysis
 
-// Audit (2026-09-30): fuzz targets for segment analysis (TS, PES, PCR and
+// Audit: fuzz targets for segment analysis (TS, PES, PCR and
 // ADTS parsing together) and for the checks that run on its output.
 
 import (

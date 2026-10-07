@@ -1,6 +1,7 @@
 package monitor
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/amillerrr/stream-analyzer/internal/analysis"
+	"github.com/amillerrr/stream-analyzer/internal/blackdetect"
 	"github.com/amillerrr/stream-analyzer/internal/hls"
 	"github.com/amillerrr/stream-analyzer/internal/ts"
 	"github.com/amillerrr/stream-analyzer/internal/tstest"
@@ -196,7 +198,7 @@ func oldIncident(t *testing.T) string {
 		write(rel, b)
 	}
 	const base = "http://origin.test/live/"
-	t0 := time.Date(2026, 9, 29, 17, 55, 0, 0, time.UTC)
+	t0 := time.Date(2026, 1, 2, 17, 55, 0, 0, time.UTC)
 	uri := func(n uint64) string { return fmt.Sprintf("hi-begin=0-dur=5340000-seq=%d.ts", n) }
 	// Playlists, one a second.
 	for i, body := range [][]byte{
@@ -231,14 +233,14 @@ func oldIncident(t *testing.T) string {
 		})
 	}
 	writeJSONFile("report.json", map[string]any{
-		"id": "20260929T175602Z_test", "channel": "test", "status": "closed",
-		"opened_at": "2026-09-29T10:56:02-07:00", "last_fault_at": "2026-09-29T10:56:02-07:00",
-		"closed_at": "2026-09-29T10:57:02-07:00", "close_reason": "post_roll_elapsed",
+		"id": "20260102T175602Z_test", "channel": "test", "status": "closed",
+		"opened_at": "2026-01-02T10:56:02-07:00", "last_fault_at": "2026-01-02T10:56:02-07:00",
+		"closed_at": "2026-01-02T10:57:02-07:00", "close_reason": "post_roll_elapsed",
 		"stream":      map[string]any{"url": base + "master.m3u8", "media_playlist_url": base + "hi.m3u8", "rendition": "0_1280x720_2000000"},
 		"fault_types": []string{"audio_pts_gap", "video_dts_gap"}, "fault_count": 2,
 		"faults": []map[string]any{
-			{"type": "video_dts_gap", "detected_at": "2026-09-29T10:56:02-07:00", "seq": 104, "message": "video DTS jumped -534.000 ms"},
-			{"type": "audio_pts_gap", "detected_at": "2026-09-29T10:56:02-07:00", "seq": 104, "message": "audio PTS jumped -534.000 ms"},
+			{"type": "video_dts_gap", "detected_at": "2026-01-02T10:56:02-07:00", "seq": 104, "message": "video DTS jumped -534.000 ms"},
+			{"type": "audio_pts_gap", "detected_at": "2026-01-02T10:56:02-07:00", "seq": 104, "message": "audio PTS jumped -534.000 ms"},
 		},
 	})
 	return dir
@@ -274,7 +276,7 @@ func TestReanalyzeOldIncident(t *testing.T) {
 	if !slices.ContainsFunc(v2.Notes, func(n string) bool { return strings.Contains(n, "seg_104.ts") && strings.Contains(n, "seq=104") }) {
 		t.Errorf("notes %q: want seg_104.ts named as a second download of seq=104", v2.Notes)
 	}
-	if v2.OpenedAt.Location() != time.UTC || v2.OpenedAt.Format(time.RFC3339) != "2026-09-29T17:56:02Z" {
+	if v2.OpenedAt.Location() != time.UTC || v2.OpenedAt.Format(time.RFC3339) != "2026-01-02T17:56:02Z" {
 		t.Errorf("opened_at %v, want the original's time in UTC", v2.OpenedAt)
 	}
 }
@@ -309,10 +311,10 @@ func TestReanalyzeMarksThePreRoll(t *testing.T) {
 	b, _ := os.ReadFile(filepath.Join(dir, "report.json"))
 	var old map[string]any
 	json.Unmarshal(b, &old)
-	old["faults"] = []map[string]any{{"type": "video_dts_gap", "detected_at": "2026-09-29T17:55:01.5Z", "seq": 103, "message": "x"}}
-	old["opened_at"] = "2026-09-29T17:55:01.5Z"
+	old["faults"] = []map[string]any{{"type": "video_dts_gap", "detected_at": "2026-01-02T17:55:01.5Z", "seq": 103, "message": "x"}}
+	old["opened_at"] = "2026-01-02T17:55:01.5Z"
 	old["segments"] = []map[string]any{{"seq": 103, "uri": "hi-begin=0-dur=5340000-seq=104.ts",
-		"fetch": map[string]any{"requested_at": "2026-09-29T17:55:01.203Z", "completed_at": "2026-09-29T17:55:01.223Z", "status": 200}}}
+		"fetch": map[string]any{"requested_at": "2026-01-02T17:55:01.203Z", "completed_at": "2026-01-02T17:55:01.223Z", "status": 200}}}
 	b, _ = json.Marshal(old)
 	os.WriteFile(filepath.Join(dir, "report.json"), b, 0o644)
 
@@ -336,3 +338,30 @@ func TestReanalyzeMarksThePreRoll(t *testing.T) {
 		t.Errorf("notes %q: want the pre-roll faults counted", v2.Notes)
 	}
 }
+
+// Reanalyze applies the same black rules as the monitor: a segment whose
+// black check can't run is not checked, and the report says how many.
+func TestReanalyzeNotesSegmentsNotChecked(t *testing.T) {
+	dir := oldIncident(t)
+	audioOnly := tstest.Base.Segment(4)
+	audioOnly.Video = nil
+	if err := os.WriteFile(filepath.Join(dir, "segments", "seg_105.ts"), audioOnly.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := testConfig(t, "http://origin.test/live/master.m3u8")
+	cfg.Blackdetect.Enabled = true
+	v2 := reanalyzed(t, dir, Options{Config: cfg, Logger: testLogger(t), BlackDetector: noBlack})
+	if !slices.ContainsFunc(v2.Notes, func(n string) bool { return strings.Contains(n, "not fully checked on 1 segment") }) {
+		t.Errorf("notes %q: want one segment not checked", v2.Notes)
+	}
+	if b := v2.Blackdetect; b == nil || !b.Enabled || b.TriggerMin != cfg.Blackdetect.TriggerMin {
+		t.Errorf("report.v2.json blackdetect %+v, want this run's settings", b)
+	}
+	i := slices.IndexFunc(v2.Segments, func(s SegmentRecord) bool { return s.Seq == 105 })
+	if i < 0 || v2.Segments[i].BlackDecode == nil || v2.Segments[i].BlackDecode.NotChecked == "" {
+		t.Errorf("segment 105 is not marked not checked: %+v", v2.Segments)
+	}
+}
+
+// noBlack is a black detector that finds no black.
+func noBlack(context.Context, string) ([]blackdetect.Interval, error) { return nil, nil }

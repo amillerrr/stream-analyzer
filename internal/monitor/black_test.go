@@ -47,12 +47,14 @@ func TestBlackRunJoinsAcrossRealSegments(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		iv, err := blackdetect.Detect(t.Context(), path, cfg.Blackdetect.Options)
+		o := cfg.Blackdetect.Options
+		o.VideoPID = seg.Video.PID
+		res, err := blackdetect.Detect(t.Context(), path, o)
 		if err != nil {
 			t.Fatal(err)
 		}
-		runs := placeBlack(seg, iv, seg.Video.FrameTicks)
-		t.Logf("segment %d: ffmpeg %+v -> %+v", seq, iv, runs)
+		runs := placeBlack(seg, res, seg.Video.FrameTicks)
+		t.Logf("segment %d: ffmpeg %+v -> %+v", seq, res.Intervals, runs)
 		if f, ok := ch.blackTrigger(seq, true, seg, runs); ok {
 			got = f
 		}
@@ -67,7 +69,8 @@ func TestBlackRunJoinsAcrossRealSegments(t *testing.T) {
 
 // A black run over frames the encoder dropped is time on screen, but not
 // black pictures: each run records its black frames and the time with no
-// frame at all, and the fault reports both.
+// frame at all, the fault reports both, and only the black frames count
+// toward trigger_min.
 func TestBlackRunSeparatesBlackFramesFromMissingFrames(t *testing.T) {
 	// No reordering (PTS = DTS + 2 frames), and every other frame dropped:
 	// 8 frames on slots 0, 2, ... 14.
@@ -82,20 +85,26 @@ func TestBlackRunSeparatesBlackFramesFromMissingFrames(t *testing.T) {
 	}
 	first := float64(seg.Video.MinPTS()) / ts.Hz
 	last := float64(seg.Video.MaxPTS()) / ts.Hz
-	runs := placeBlack(seg, []blackdetect.Interval{{Start: first, End: last, Duration: last - first}}, tstest.FrameTicks)
+	runs := placeBlack(seg, reported(seg, blackdetect.Interval{Start: first, End: last, Duration: last - first}), tstest.FrameTicks)
 	if len(runs) != 1 {
 		t.Fatalf("runs %+v", runs)
 	}
 	r := runs[0]
 	// On screen from slot 0 to the end of slot 14: 15 slots, 7 of them
 	// with no frame.
-	if r.Frames != 8 || math.Abs(r.Duration-0.5005) > 1e-6 || math.Abs(r.NoFrameS-0.233567) > 1e-6 {
-		t.Errorf("run %+v: want 8 black frames over 0.500500 s, 0.233567 s of it with no frame", r)
+	if r.Frames != 8 || math.Abs(r.Duration-0.5005) > 1e-6 || math.Abs(r.BlackS-0.266933) > 1e-6 || math.Abs(r.NoFrameS-0.233567) > 1e-6 {
+		t.Errorf("run %+v: want 8 black frames (0.266933 s) over 0.500500 s, 0.233567 s of it with no frame", r)
 	}
 
 	cfg := testConfig(t, "http://127.0.0.1:1/never.m3u8")
 	cfg.Blackdetect.TriggerMin = 0.5
 	ch := newTestMonitor(t, cfg, nil).channels[0]
+	ch.variant = &hls.Variant{FrameRate: "29.970"}
+	if f, ok := ch.blackTrigger(1, true, seg, runs); ok {
+		t.Errorf("0.267 s of black frames over 0.5005 s on screen reached trigger_min 0.5 s: %s", f.Message)
+	}
+	cfg.Blackdetect.TriggerMin = 0.25
+	ch = newTestMonitor(t, cfg, nil).channels[0]
 	ch.variant = &hls.Variant{FrameRate: "29.970"}
 	f, ok := ch.blackTrigger(1, true, seg, runs)
 	if !ok {
@@ -141,11 +150,11 @@ func TestShortBlackRunAtABoundaryStillJoins(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		iv, err := m.detectBlack(t.Context(), path)
+		res, err := m.detectBlack(t.Context(), path, seg.Video.PID, "")
 		if err != nil {
 			t.Fatal(err)
 		}
-		runs := placeBlack(seg, iv, seg.Video.FrameTicks)
+		runs := placeBlack(seg, res, seg.Video.FrameTicks)
 		t.Logf("segment %d: %+v", seq, runs)
 		if f, ok := ch.blackTrigger(seq, true, seg, runs); ok {
 			got = f
@@ -157,4 +166,25 @@ func TestShortBlackRunAtABoundaryStillJoins(t *testing.T) {
 	if l := got.Values["longest_run_s"].(float64); math.Abs(l-0.60) > 0.005 {
 		t.Errorf("longest_run_s = %.3f, want 0.600", l)
 	}
+}
+
+// blackdetect never runs without the parser's video PID: with no -map,
+// ffmpeg would pick a stream itself, so that is an error, not a pass.
+func TestBlackdetectNeedsTheVideoPID(t *testing.T) {
+	ff := needFFmpeg(t, "mpeg2video")
+	path := genFFmpeg(t, ff, filepath.Join(t.TempDir(), "black.ts"),
+		"-f", "lavfi", "-i", "color=black:size=64x64:rate=25:d=1", "-c:v", "mpeg2video", "-f", "mpegts")
+	cfg := testConfig(t, "http://127.0.0.1:1/never.m3u8")
+	cfg.Blackdetect.FFmpeg = ff
+	m := newTestMonitor(t, cfg, nil)
+	if res, err := m.detectBlack(t.Context(), path, 0, ""); err == nil {
+		t.Errorf("no PID: %+v, no error", res)
+	}
+}
+
+// reported is what a detector that reports only black runs (like
+// Options.BlackDetector) stands for: every frame decoded, the ones in iv
+// black.
+func reported(seg *analysis.Segment, iv ...blackdetect.Interval) blackdetect.Result {
+	return blackdetect.Result{Intervals: iv, Frames: framesFromIntervals(seg.Video, iv, tstest.FrameTicks)}
 }

@@ -28,7 +28,7 @@ func fetched(t *testing.T, r *rendition, seq uint64, s tstest.Segment, prev *uin
 	}
 	r.want([]uint64{seq})
 	r.segs[seq].Status = statusFetched
-	r.data[seq] = renditionData{seg: seg, prev: prev, black: placeBlack(seg, black, tstest.FrameTicks)}
+	r.data[seq] = renditionData{seg: seg, prev: prev, black: placeBlack(seg, reported(seg, black...), tstest.FrameTicks)}
 }
 
 func newRendition() *rendition {
@@ -42,7 +42,7 @@ func newRendition() *rendition {
 // one was stalled: it moved on (not reproduced), it listed nothing newer
 // (reproduced), or it was never fetched then (pending, then inconclusive).
 func TestStallVerdictNeedsThePlaylistDuringTheStall(t *testing.T) {
-	at := time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC)
+	at := time.Date(2026, 1, 3, 12, 0, 0, 0, time.UTC)
 	f := FaultRecord{Type: analysis.FaultStall, Seq: 402, DetectedAt: at}
 	for _, tc := range []struct {
 		name     string

@@ -47,8 +47,7 @@ func evTypes(es []Event) []string {
 }
 
 // A -16.7 ms (half-frame) video DTS step inside a segment is invisible; the
-// same step at a segment boundary is a video_dts_gap fault (as in incident
-// 20260929T222904Z_channel9, deviation -16.678 ms).
+// same step at a segment boundary is a video_dts_gap fault.
 func TestAuditDetInternalHalfFrameStepIsInvisible(t *testing.T) {
 	const half = tstest.FrameTicks / 2
 	// Inside: segment 1 steps back half a frame at frame 90; everything after

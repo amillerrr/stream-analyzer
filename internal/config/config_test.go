@@ -162,3 +162,63 @@ func TestShippedChannelsFile(t *testing.T) {
 		}
 	}
 }
+
+// pix_th and pic_th are bounded where no ordinary picture can count as
+// black: pix_th at most 0.2 and pic_th at least 0.8. At pic_th 0.5 a
+// windowboxed picture (44 % bars) is black, at pix_th 0.3 a dark but
+// visible one. Swapped values (their names differ by one letter) say so.
+func TestBlackThresholdsThatMakePicturesBlackAreRejected(t *testing.T) {
+	const ch = "channels:\n  - name: a\n    url: https://h.example/a.m3u8\n"
+	for _, tc := range []struct {
+		yaml string
+		want string // "" when accepted
+	}{
+		{"  pix_th: 0\n  pic_th: 1\n", ""},
+		{"  pix_th: 0.2\n  pic_th: 0.8\n", ""},
+		{"  pix_th: 0.21\n", "blackdetect.pix_th"},
+		{"  pic_th: 0.79\n", "blackdetect.pic_th"},
+		{"  pix_th: -0.01\n", "blackdetect.pix_th"},
+		{"  pic_th: 0\n", "blackdetect.pic_th"},
+		{"  pix_th: 1\n", "blackdetect.pix_th"},
+		{"  pix_th: 0.98\n  pic_th: 0.10\n", "swapped"},
+	} {
+		_, err := Parse([]byte("blackdetect:\n" + tc.yaml + ch))
+		switch {
+		case tc.want == "" && err != nil:
+			t.Errorf("%q: %v", tc.yaml, err)
+		case tc.want != "" && (err == nil || !strings.Contains(err.Error(), tc.want)):
+			t.Errorf("%q: err = %v, want it to mention %q", tc.yaml, err, tc.want)
+		}
+	}
+}
+
+// allow_openh264 is off unless set.
+func TestAllowOpenH264(t *testing.T) {
+	const ch = "channels:\n  - name: a\n    url: https://h.example/a.m3u8\n"
+	for doc, want := range map[string]bool{ch: false, "blackdetect:\n  allow_openh264: true\n" + ch: true} {
+		c, err := Parse([]byte(doc))
+		if err != nil || c.Blackdetect.AllowOpenH264 != want {
+			t.Errorf("%q: allow_openh264 %v, %v; want %v", doc, c.Blackdetect.AllowOpenH264, err, want)
+		}
+	}
+}
+
+// A channel's color_range forces how black reads its luma: limited or
+// full; left out, as the stream signals.
+func TestChannelColorRange(t *testing.T) {
+	for _, tc := range []struct{ value, want, err string }{
+		{"", "", ""}, {"limited", "limited", ""}, {"full", "full", ""}, {"pc", "", "color_range"},
+	} {
+		doc := "channels:\n  - name: a\n    url: https://h.example/a.m3u8\n"
+		if tc.value != "" {
+			doc += "    color_range: " + tc.value + "\n"
+		}
+		c, err := Parse([]byte(doc))
+		switch {
+		case tc.err != "" && (err == nil || !strings.Contains(err.Error(), tc.err)):
+			t.Errorf("%q: err %v, want one naming %s", tc.value, err, tc.err)
+		case tc.err == "" && (err != nil || c.Channels[0].ColorRange != tc.want):
+			t.Errorf("%q: %+v, %v", tc.value, c.Channels, err)
+		}
+	}
+}

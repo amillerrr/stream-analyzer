@@ -244,7 +244,7 @@ func TestAuditRepeatedCapturesHoldAnIncidentOpenPastMaxIncident(t *testing.T) {
 	cfg := testConfig(t, srv.URL+"/live/test.m3u8")
 	cfg.PostRoll, cfg.MergeWindow, cfg.MaxIncident = time.Minute, time.Minute, 10*time.Minute
 	var mu sync.Mutex
-	now := time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC)
+	now := time.Date(2026, 1, 3, 12, 0, 0, 0, time.UTC)
 	clock := func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
 	m, err := New(Options{Config: cfg, Logger: testLogger(t), Now: clock})
 	if err != nil {

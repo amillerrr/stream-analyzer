@@ -58,8 +58,8 @@ func TestAuditTornRowGluesNextRow(t *testing.T) {
 	m := newTestMonitor(t, cfg, nil)
 	path := filepath.Join(cfg.DataDir, "scte35.csv")
 	os.MkdirAll(cfg.DataDir, 0o755)
-	os.WriteFile(path, []byte(strings.Join(cueColumns, ",")+"\n2026-09-30T00:00:00.000Z,test,1,OU"), 0o644)
-	if err := m.appendCSV("scte35.csv", cueColumns, map[string]string{"time_utc": "2026-09-30T00:00:06.000Z", "channel": "test", "seq": "2", "scte35_tag": "CONT"}); err != nil {
+	os.WriteFile(path, []byte(strings.Join(cueColumns, ",")+"\n2026-01-03T00:00:00.000Z,test,1,OU"), 0o644)
+	if err := m.appendCSV("scte35.csv", cueColumns, map[string]string{"time_utc": "2026-01-03T00:00:06.000Z", "channel": "test", "seq": "2", "scte35_tag": "CONT"}); err != nil {
 		t.Fatal(err)
 	}
 	b, _ := os.ReadFile(path)

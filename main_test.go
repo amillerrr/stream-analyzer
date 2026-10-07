@@ -5,12 +5,15 @@ import (
 	"errors"
 	"flag"
 	"io"
+	"log"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -151,10 +154,10 @@ func TestReanalyzeCommand(t *testing.T) {
 	dir := t.TempDir()
 	cfg := filepath.Join(dir, "channels.yaml")
 	os.WriteFile(cfg, []byte("blackdetect:\n  enabled: false\nchannels:\n  - name: alpha\n    url: http://127.0.0.1:1/x.m3u8\n"), 0o644)
-	inc := filepath.Join(dir, "20260929T175600Z_alpha")
+	inc := filepath.Join(dir, "20260102T175600Z_alpha")
 	os.MkdirAll(inc, 0o755)
-	os.WriteFile(filepath.Join(inc, "report.json"), []byte(`{"id":"20260929T175600Z_alpha","channel":"alpha","status":"closed",
-		"opened_at":"2026-09-29T10:56:00-07:00","stream":{"url":"http://127.0.0.1:1/x.m3u8"},
+	os.WriteFile(filepath.Join(inc, "report.json"), []byte(`{"id":"20260102T175600Z_alpha","channel":"alpha","status":"closed",
+		"opened_at":"2026-01-02T10:56:00-07:00","stream":{"url":"http://127.0.0.1:1/x.m3u8"},
 		"faults":[{"type":"video_dts_gap","seq":104,"message":"x"}]}`), 0o644)
 	notIncident := filepath.Join(dir, "empty")
 	os.MkdirAll(notIncident, 0o755)
@@ -175,5 +178,99 @@ func TestReanalyzeCommand(t *testing.T) {
 	}
 	if err := runReanalyze([]string{"-h"}, io.Discard, io.Discard); !errors.Is(err, flag.ErrHelp) {
 		t.Errorf("runReanalyze(-h) = %v, want flag.ErrHelp", err)
+	}
+}
+
+// openH264OnlyFFmpeg writes an ffmpeg that answers -version and -decoders
+// with an OpenH264-only build and does nothing else.
+func openH264OnlyFFmpeg(t *testing.T) string {
+	t.Helper()
+	ff := filepath.Join(t.TempDir(), "ffmpeg")
+	script := "#!/bin/sh\ncase \"$*\" in\n*-version*) echo 'ffmpeg version 7.1.5 Copyright (c) 2000-2026 the FFmpeg developers';;\n" +
+		"*-decoders*) echo ' V....D libopenh264          OpenH264 H.264 / AVC / MPEG-4 AVC / MPEG-4 part 10 (codec h264)';;\nesac\n"
+	if err := os.WriteFile(ff, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return ff
+}
+
+// The monitor and reanalyze refuse an ffmpeg that decodes H.264 only with
+// OpenH264, and say how to go on.
+func TestRunRefusesOpenH264OnlyFFmpeg(t *testing.T) {
+	dir := t.TempDir()
+	cfg := filepath.Join(dir, "channels.yaml")
+	os.WriteFile(cfg, []byte("listen: \"\"\nblackdetect:\n  ffmpeg: "+openH264OnlyFFmpeg(t)+"\nchannels:\n  - name: a\n    url: http://127.0.0.1:1/x.m3u8\n"), 0o644)
+	// A monitor that starts anyway would never return: it runs in a child
+	// that is stopped after a while.
+	cmd := exec.Command(os.Args[0])
+	cmd.Env = append(os.Environ(), "STREAM_ANALYZER_TEST_ARGS=-config\n"+cfg+"\n-data\n"+filepath.Join(dir, "data"))
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		cmd.Process.Kill()
+		<-done
+	}
+	if !strings.Contains(stderr.String(), "allow_openh264") {
+		t.Errorf("the monitor started, or stopped without naming allow_openh264:\n%s", stderr.String())
+	}
+	if err := runReanalyze([]string{"-config", cfg, dir}, io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "allow_openh264") {
+		t.Errorf("runReanalyze = %v, want a refusal naming allow_openh264", err)
+	}
+}
+
+// At start the log names the ffmpeg every run uses: its resolved path, its
+// version and its decoders, and that the self-test passed.
+func TestRunLogsTheFFmpegItUses(t *testing.T) {
+	ff, err := exec.LookPath("ffmpeg")
+	if err != nil {
+		t.Skip("ffmpeg not on PATH")
+	}
+	real, _ := filepath.EvalSymlinks(ff)
+	dir := t.TempDir()
+	cfg := filepath.Join(dir, "channels.yaml")
+	os.WriteFile(cfg, []byte("listen: \"\"\nchannels:\n  - name: test\n    url: http://127.0.0.1:1/never.m3u8\n"), 0o644)
+	cmd := exec.Command(os.Args[0])
+	cmd.Env = append(os.Environ(), "STREAM_ANALYZER_TEST_ARGS=-config\n"+cfg+"\n-data\n"+filepath.Join(dir, "data"))
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(3 * time.Second)
+	cmd.Process.Signal(syscall.SIGTERM)
+	cmd.Wait()
+	log, _ := os.ReadFile(filepath.Join(dir, "data", "stream-analyzer.log"))
+	for _, want := range []string{"path=" + real, "version=", "h264_decoder=h264", "hevc_decoder=", "self_test=passed"} {
+		if !strings.Contains(string(log), want) {
+			t.Errorf("the log has no %q:\n%s", want, log)
+		}
+	}
+}
+
+// Every time in a log line is UTC: an attribute's too, and lines from Go's
+// log package (net/http's server errors) go through the same handler.
+func TestEveryLogTimeIsUTC(t *testing.T) {
+	saved := time.Local
+	time.Local = time.FixedZone("PDT", -7*3600)
+	defer func() { time.Local = saved }()
+	defer slog.SetDefault(slog.Default())
+	defer log.SetOutput(log.Writer())
+	defer log.SetFlags(log.Flags())
+	var b bytes.Buffer
+	logger := newLogger(&b, slog.LevelInfo)
+	logger.Info("hello", "at", time.Date(2026, 1, 2, 3, 4, 5, 0, time.Local))
+	useLogger(logger)
+	log.Print("from the log package")
+	out := b.String()
+	if !strings.Contains(out, "at=2026-01-02T10:04:05.000Z") {
+		t.Errorf("a time attribute is not UTC:\n%s", out)
+	}
+	if !regexp.MustCompile(`time=\d{4}-\d\d-\d\dT[0-9:.]+Z level=INFO msg="from the log package"`).MatchString(out) {
+		t.Errorf("the log package's line is not a UTC log line:\n%s", out)
 	}
 }

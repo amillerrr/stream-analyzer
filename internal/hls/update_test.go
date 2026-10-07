@@ -156,8 +156,8 @@ func TestCheckUpdatePositional(t *testing.T) {
 }
 
 // The violations name what happened in plain words, with the evidence.
-// cont is the tag the origin put on an entry that became first at the head
-// of a break (channel7 61800449, 2026-09-30).
+// cont is the tag an origin puts on an entry that became first at the head
+// of a break.
 const cont = "#EXT-X-CUE-OUT-CONT:ElapsedTime=0.034,Duration=120.000"
 
 // A rewrite of the first entry's cue tags names the tags it lost and

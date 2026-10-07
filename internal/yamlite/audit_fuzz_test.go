@@ -1,6 +1,6 @@
 package yamlite
 
-// Audit (2026-09-30): fuzz target for the YAML subset parser.
+// Audit: fuzz target for the YAML subset parser.
 
 import (
 	"os"

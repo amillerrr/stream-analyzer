@@ -81,7 +81,7 @@ func copyFile(src, dst string) error {
 // the window before the last segment (lastSegment; zero if none yet).
 // During a stall nothing new arrives, so without that exception the
 // segments from before it would age out while it lasts. A segment's files
-// (seg_N.ts and its sidecar seg_N.json, written after its check) and a
+// (seg_<N>_<hash>.ts and its sidecar .json, written after its check) and a
 // playlist's go together, by the newer of their times, so an incident
 // never gets one without the other.
 func pruneBuffer(dir string, now time.Time, window time.Duration, lastSegment time.Time) error {
@@ -125,7 +125,7 @@ func pruneBuffer(dir string, now time.Time, window time.Duration, lastSegment ti
 }
 
 // fileGroup names the group a buffer file is pruned with: a segment's files
-// (seg_N.ts, its sidecar seg_N.json, and seg_N.attemptK.body for refused
+// (seg_<N>_<hash>.ts, its sidecar .json, and .attemptK.body for refused
 // attempts) share one, and so do a playlist fetch's (.m3u8 or .m3u8.gz,
 // and .json).
 func fileGroup(name string) string {

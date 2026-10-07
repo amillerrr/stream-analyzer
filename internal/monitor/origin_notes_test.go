@@ -39,7 +39,7 @@ func noted(t *testing.T, prev, cur []byte) []string {
 		}
 		return pl
 	}
-	at := time.Date(2026, 9, 30, 18, 44, 0, 0, time.UTC)
+	at := time.Date(2026, 1, 3, 18, 44, 0, 0, time.UTC)
 	meta := FetchMeta{Status: 200}
 	var p pollState
 	p.update(parse(prev), "http://h/p.m3u8", "p1", meta, at, 3)
@@ -116,8 +116,8 @@ func TestTargetDurationChangesAreCountedAndListed(t *testing.T) {
 }
 
 // The origin sometimes re-tags the entry that becomes first at the head of
-// a break (CUE-OUT becoming CUE-OUT-CONT, channel7 61800449 on
-// 2026-09-30): its practice, noted, not a rewritten-entry fault.
+// a break (CUE-OUT becoming CUE-OUT-CONT): its practice, noted, not a
+// rewritten-entry fault.
 func TestFirstEntryCueRewriteIsNoted(t *testing.T) {
 	got := noted(t, taggedPlaylist(7, 100, map[uint64]string{101: "#EXT-X-CUE-OUT:120.000"}, 100, 101, 102),
 		taggedPlaylist(7, 101, map[uint64]string{101: "#EXT-X-CUE-OUT-CONT:ElapsedTime=0.034,Duration=120.000"}, 101, 102, 103))

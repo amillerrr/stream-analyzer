@@ -312,6 +312,25 @@ func sidecars(dir string) []SegmentRecord {
 }
 
 // note adds a note to the channel's open incident, if any.
+func (in *incidents) note(c *Channel, text string) {
+	in.mu.Lock()
+	defer in.mu.Unlock()
+	if inc := in.open[c.name]; inc != nil {
+		inc.notes = append(inc.notes, text)
+		in.write(inc)
+	}
+}
+
+// openDir is the channel's open incident's directory, or "".
+func (in *incidents) openDir(channel string) string {
+	in.mu.Lock()
+	defer in.mu.Unlock()
+	if inc := in.open[channel]; inc != nil {
+		return inc.dir
+	}
+	return ""
+}
+
 // originNote lists an origin note in the channel's open incident, and keeps
 // it for the pre-roll of one that opens later. Both happen under in.mu, so
 // a note is listed once whether the incident opens before or after it.
@@ -422,7 +441,7 @@ func (in *incidents) start(c *Channel, now time.Time) (*incident, error) {
 		pending:    map[string]time.Time{},
 		report: Report{
 			ID: id, Channel: c.name, Status: "open", OpenedAt: now.UTC(), Stream: info,
-			OriginNotes: c.preRollNotes(now),
+			OriginNotes: c.preRollNotes(now), Blackdetect: in.m.blackdetectInfo(c.cfg.ColorRange),
 		},
 	}
 	// Register first: from here on the channel copies every new file itself,
@@ -468,10 +487,11 @@ func (in *incidents) start(c *Channel, now time.Time) (*incident, error) {
 			}
 			r := &rendition{
 				variant: v, url: url,
-				dir:      rdir,
-				blackMin: cfg.Blackdetect.TriggerMin,
-				segs:     map[uint64]*RenditionSegment{},
-				data:     map[uint64]renditionData{},
+				dir:        rdir,
+				blackMin:   cfg.Blackdetect.TriggerMin,
+				colorRange: c.cfg.ColorRange,
+				segs:       map[uint64]*RenditionSegment{},
+				data:       map[uint64]renditionData{},
 			}
 			inc.rend = append(inc.rend, r)
 			in.fetchers.Add(1)
@@ -536,13 +556,16 @@ func (inc *incident) addFault(f analysis.Fault, now time.Time) {
 	})
 }
 
-// addSegment adds or updates a segment in the report, kept in sequence order.
+// addSegment adds or updates a segment in the report, kept in number
+// order. A segment is its number and URI: two segments may share a number.
 func (inc *incident) addSegment(rec SegmentRecord) {
 	if rec.URI == "" && rec.Seq == 0 {
 		return
 	}
 	segs := inc.report.Segments
-	i, found := slices.BinarySearchFunc(segs, rec.Seq, func(s SegmentRecord, seq uint64) int { return cmp.Compare(s.Seq, seq) })
+	i, found := slices.BinarySearchFunc(segs, rec, func(s, r SegmentRecord) int {
+		return cmp.Or(cmp.Compare(s.Seq, r.Seq), cmp.Compare(s.URI, r.URI))
+	})
 	if found {
 		segs[i] = rec
 	} else {
@@ -725,12 +748,18 @@ func (r *Report) derive() {
 
 	r.Discontinuities, r.SCTE35, r.MonitorGaps, r.BlackRuns = nil, nil, nil, nil
 	bySeq := map[uint64]*SegmentRecord{}
+	decoders := map[string]bool{}
 	for i := range r.Segments {
 		s := &r.Segments[i]
 		bySeq[s.Seq] = s
+		if s.BlackDecode != nil && s.BlackDecode.Decoder != "" {
+			decoders[s.BlackDecode.Decoder] = true
+		}
 		for _, b := range s.Black {
 			r.BlackRuns = append(r.BlackRuns, BlackRun{
 				Seq: s.Seq, Start: b.Start, End: b.End, Duration: b.Duration, StartPTS: b.StartPTS, EndPTS: b.EndPTS,
+				BlackFrames: b.Frames, BlackFramesS: b.BlackS, UndecodedFrames: b.UndecodedFrames, NoFrameS: b.NoFrameS,
+				Unconfirmed: b.Unconfirmed, PixFmt: b.PixFmt, ColorRange: b.ColorRange,
 			})
 		}
 		if s.Gap != nil {
@@ -742,6 +771,9 @@ func (r *Report) derive() {
 		if len(s.SCTE35) > 0 {
 			r.SCTE35 = append(r.SCTE35, TagRecord{Seq: s.Seq, Tags: s.SCTE35})
 		}
+	}
+	if r.Blackdetect != nil {
+		r.Blackdetect.DecodersUsed = slices.Sorted(maps.Keys(decoders))
 	}
 	for i := range r.Faults {
 		f := &r.Faults[i]

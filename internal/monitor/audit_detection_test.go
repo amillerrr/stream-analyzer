@@ -20,47 +20,47 @@ import (
 	"github.com/amillerrr/stream-analyzer/internal/tstest"
 )
 
-// realInd holds real segments 61791563-61791567 of incident
-// 20260930T034436Z_channel4; ../../data is git-ignored, so the test
-// that reads it is skipped where it is absent.
-var realInd = filepath.Join("..", "..", "data", "incidents", "20260930T034436Z_channel4", "segments")
-
-// The four black segments 61791563-61791566 of incident
-// 20260930T034436Z_channel4 (read from ../../data), run through the real
-// Analyze, real ffmpeg blackdetect and blackTrigger.
-func TestAuditDetRealBlackJoinSplit(t *testing.T) {
+// A continuous black run over four 6 s segments, cut by ffmpeg's segment
+// muxer, run through the real Analyze, real ffmpeg blackdetect and
+// blackTrigger: at the last segment the run is joined from all four.
+func TestAuditDetBlackJoinsAcrossFourSegments(t *testing.T) {
+	ff := needFFmpeg(t, "mpeg2video")
+	dir := t.TempDir()
+	genFFmpeg(t, ff, filepath.Join(dir, "seg_%d.ts"),
+		"-f", "lavfi", "-i", "color=c=black:size=160x90:rate=30000/1001:duration=24",
+		"-c:v", "mpeg2video", "-g", "30", "-force_key_frames", "expr:gte(t,n_forced*6)",
+		"-f", "segment", "-segment_time", "6", "-segment_format", "mpegts")
 	cfg := testConfig(t, "http://127.0.0.1:1/never.m3u8")
-	cfg.Blackdetect.Enabled = true
+	cfg.Blackdetect.Enabled, cfg.Blackdetect.FFmpeg = true, ff
 	m := newTestMonitor(t, cfg, nil)
 	ch := m.channels[0]
 	var last float64
-	for _, seq := range []uint64{61791563, 61791564, 61791565, 61791566} {
-		path := filepath.Join(realInd, fmt.Sprintf("seg_%d.ts", seq))
+	for seq := range uint64(4) {
+		path := filepath.Join(dir, fmt.Sprintf("seg_%d.ts", seq))
 		body, err := os.ReadFile(path)
 		if err != nil {
-			t.Skip(err)
+			t.Fatal(err)
 		}
 		seg, err := analysis.Analyze(body)
 		if err != nil {
 			t.Fatal(err)
 		}
-		iv, err := blackdetect.Detect(context.Background(), path, cfg.Blackdetect.Options)
+		o := cfg.Blackdetect.Options
+		o.VideoPID = seg.Video.PID
+		res, err := blackdetect.Detect(context.Background(), path, o)
 		if err != nil {
 			t.Fatal(err)
 		}
-		dur, _ := seg.Duration()
-		frame := float64(seg.Video.FrameTicks) / ts.Hz
-		f, ok := ch.blackTrigger(seq, true, seg, placeBlack(seg, iv, 3003)) // consecutive playlist entries
+		f, ok := ch.blackTrigger(seq, true, seg, placeBlack(seg, res, 3003)) // consecutive playlist entries
 		longest := 0.0
 		if ok {
-			longest = f.Values["longest_run_s"].(float64)
+			longest = f.Values["black_frames_s"].(float64)
 		}
-		t.Logf("seq %d: black %v; dur %.6f frame %.6f; End-(dur-2*frame)=%+.6f; carried=%v; fault longest=%.3f %q",
-			seq, iv, dur, frame, iv[len(iv)-1].End-(dur-2*frame), ch.black.seconds > 0, longest, f.Message)
+		t.Logf("seq %d: carried=%v; fault black_frames_s=%.3f %q", seq, ch.black.open, longest, f.Message)
 		last = longest
 	}
-	if last < 20 {
-		t.Errorf("a continuous 23.7 s black run over 4 segments was reported with longest %.3f s at its last segment", last)
+	if last < 23.9 {
+		t.Errorf("a continuous 24 s black run over 4 segments was reported with %.3f s of black frames at its last segment", last)
 	}
 }
 
@@ -70,7 +70,7 @@ func TestAuditDetStallOutlastingMaxIncidentLosesItsEnd(t *testing.T) {
 	cfg := testConfig(t, "http://127.0.0.1:1/never.m3u8")
 	cfg.PostRoll, cfg.MergeWindow, cfg.MaxIncident = time.Minute, time.Minute, 10*time.Minute
 	cfg.StallTargetDurations = 3
-	t0 := time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC)
+	t0 := time.Date(2026, 1, 3, 12, 0, 0, 0, time.UTC)
 	clock := t0
 	m := newTestMonitor(t, cfg, func() time.Time { return clock })
 	ch := m.channels[0]
@@ -161,7 +161,7 @@ func TestAuditDetPlaylistRewriteIsUnnoticed(t *testing.T) {
 func TestAuditDetSuppressedFaultIsDroppedFromAnotherOpenIncident(t *testing.T) {
 	cfg := testConfig(t, "http://127.0.0.1:1/never.m3u8")
 	cfg.PostRoll, cfg.MergeWindow, cfg.MaxIncident = time.Minute, time.Minute, 5*time.Minute
-	clock := time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC)
+	clock := time.Date(2026, 1, 3, 12, 0, 0, 0, time.UTC)
 	m := newTestMonitor(t, cfg, func() time.Time { return clock })
 	in, ch := m.incidents, m.channels[0]
 	start := clock
@@ -264,7 +264,7 @@ func TestAuditDetRestartTakenForStaleCopy(t *testing.T) {
 func TestAuditDetSingleLateFaultGetsSuppressed(t *testing.T) {
 	cfg := testConfig(t, "http://127.0.0.1:1/never.m3u8")
 	cfg.PostRoll, cfg.MergeWindow, cfg.MaxIncident = time.Minute, time.Minute, 10*time.Minute
-	clock := time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC)
+	clock := time.Date(2026, 1, 3, 12, 0, 0, 0, time.UTC)
 	m := newTestMonitor(t, cfg, func() time.Time { return clock })
 	in, ch := m.incidents, m.channels[0]
 	start := clock

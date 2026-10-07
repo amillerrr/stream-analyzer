@@ -385,19 +385,20 @@ func TestShortBlackRunsAreRecordedButOpenNoIncident(t *testing.T) {
 	}
 	cfg := testConfig(t, srv.URL+"/live/test.m3u8")
 	cfg.Blackdetect.Enabled = true
-	short := blackdetect.Interval{Start: 0.1, End: 0.4, Duration: 0.3}
+	// Frames 3 to 11 (ffmpeg reports runs on frame times).
+	short := blackdetect.Interval{Start: 0.1001, End: 0.4004, Duration: 0.3003}
 
 	_, recs := run(t, cfg, seen(702), fakeBlack(map[uint64][]blackdetect.Interval{700: {short}}))
 
-	if r := recs[700]; len(r.Black) != 1 || r.Black[0].Start != 0.1 || r.Black[0].End != 0.4 || r.Black[0].Duration != 0.3 || len(r.Faults) != 0 {
+	if r := recs[700]; len(r.Black) != 1 || r.Black[0].Start != 0.1001 || r.Black[0].End != 0.4004 || r.Black[0].Duration != 0.3003 || len(r.Faults) != 0 {
 		t.Errorf("700: black=%+v faults=%v", r.Black, r.Faults)
 	}
 	rep := onlyIncident(t, cfg)
 	if !slices.Equal(rep.FaultTypes, []string{analysis.FaultDiscontinuity}) {
 		t.Errorf("fault types = %v, want only discontinuity", rep.FaultTypes)
 	}
-	if b := rep.BlackRuns; len(b) != 1 || b[0].Seq != 700 || b[0].Start != 0.1 || b[0].End != 0.4 || b[0].Duration != 0.3 || b[0].StartPTS == 0 {
-		t.Errorf("black_runs = %+v, want 700's run at 0.1-0.4 s with its PTS", b)
+	if b := rep.BlackRuns; len(b) != 1 || b[0].Seq != 700 || b[0].Start != 0.1001 || b[0].End != 0.4004 || b[0].Duration != 0.3003 || b[0].StartPTS == 0 {
+		t.Errorf("black_runs = %+v, want 700's run at 0.1001-0.4004 s with its PTS", b)
 	}
 }
 

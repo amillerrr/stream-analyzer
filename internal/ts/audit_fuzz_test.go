@@ -1,6 +1,6 @@
 package ts
 
-// Audit (2026-09-30): fuzz targets and spec-derived round trips for the TS,
+// Audit: fuzz targets and spec-derived round trips for the TS,
 // PES and PCR parsing. The encoders here are written from ISO/IEC 13818-1
 // (2.4.3.4 adaptation field, 2.4.3.7 PES header), not from this package, so
 // the round trips check the bit layout independently.

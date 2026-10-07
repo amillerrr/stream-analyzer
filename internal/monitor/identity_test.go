@@ -22,7 +22,7 @@ func numberedPlaylist(variant string, msn uint64, nums ...uint64) []byte {
 	return []byte(b.String())
 }
 
-// The origin's pattern of 2026-09-29, with origin-numbered URIs: number 102
+// An origin's renumbering pattern, with origin-numbered URIs: number 102
 // is never produced (seq=103 sits at position 102), the playlist is later
 // renumbered (MEDIA-SEQUENCE jumps to 103), and the media jumps 10 s at 104
 // in both renditions. Each origin segment must be downloaded once and known

@@ -20,6 +20,7 @@ import (
 	"github.com/amillerrr/stream-analyzer/internal/analysis"
 	"github.com/amillerrr/stream-analyzer/internal/blackdetect"
 	"github.com/amillerrr/stream-analyzer/internal/config"
+	"github.com/amillerrr/stream-analyzer/internal/ts"
 )
 
 // Options configure a Monitor. Only Config is required.
@@ -44,7 +45,12 @@ type Options struct {
 	// OriginRetryDelay is the pause before the single retry of a segment
 	// the origin refused, with any 4xx or 5xx (default 1s).
 	OriginRetryDelay time.Duration
-	// BlackDetector replaces ffmpeg blackdetect; nil uses ffmpeg.
+	// FFmpeg is the ffmpeg build found at start (blackdetect.Inspect),
+	// recorded in every report.
+	FFmpeg blackdetect.Build
+	// BlackDetector replaces ffmpeg blackdetect; nil uses ffmpeg. It
+	// reports black runs as ffmpeg prints them, and every frame the parser
+	// found counts as decoded.
 	BlackDetector func(ctx context.Context, path string) ([]blackdetect.Interval, error)
 	// FreeSpace returns the free bytes on dir's filesystem; nil asks the
 	// operating system.
@@ -181,34 +187,92 @@ func (m *Monitor) runContext() context.Context {
 	return context.Background()
 }
 
-// detectBlack runs blackdetect, holding one of the ffmpeg worker slots.
-// ffmpeg reports every black run (d=0); the monitor applies d to whole
-// runs, joined across segments (see keepBlack).
-func (m *Monitor) detectBlack(ctx context.Context, path string) ([]blackdetect.Interval, error) {
+// detectBlack runs blackdetect on the video stream with PID pid (the one
+// the TS parser analyzed), holding one of the ffmpeg worker slots. ffmpeg
+// reports every black run (d=0); the monitor applies d to whole runs,
+// joined across segments (see keepBlack).
+func (m *Monitor) detectBlack(ctx context.Context, path string, pid uint16, rng string) (blackdetect.Result, error) {
 	select {
 	case m.ffmpeg <- struct{}{}:
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return blackdetect.Result{}, ctx.Err()
 	}
 	defer func() { <-m.ffmpeg }()
+	if pid == 0 {
+		// Without -map ffmpeg would choose a stream itself.
+		return blackdetect.Result{}, errors.New("blackdetect: no video PID to decode")
+	}
 	if m.opts.BlackDetector != nil {
-		return m.opts.BlackDetector(ctx, path)
+		iv, err := m.opts.BlackDetector(ctx, path)
+		return blackdetect.Result{Intervals: iv}, err
 	}
 	o := m.cfg.Blackdetect.Options
-	o.Duration = 0
+	o.Duration, o.VideoPID, o.Range = 0, pid, rng
 	return blackdetect.Detect(ctx, path, o)
 }
 
-// blackRuns runs blackdetect on a saved segment and places the runs it
-// finds in seg's PTS; frame is the video frame duration in ticks. Runs
-// shorter than d that can't join a neighbour are dropped (see keepBlack).
-func (m *Monitor) blackRuns(ctx context.Context, path string, seg *analysis.Segment, frame int64) ([]BlackInterval, error) {
-	iv, err := m.detectBlack(ctx, path)
-	if err != nil {
-		return nil, err
+// blackdetectInfo is how black is checked on a channel whose color_range
+// is rng, for report.json.
+func (m *Monitor) blackdetectInfo(rng string) *BlackdetectInfo {
+	bd := m.cfg.Blackdetect
+	o := bd.Options
+	o.Duration, o.Range = 0, rng
+	return &BlackdetectInfo{
+		Enabled: bd.Enabled, FFmpeg: m.opts.FFmpeg, Filter: o.Chain(), Map: "0:i:0x<the parser's video PID>",
+		D: bd.Duration, PixTh: bd.PixelThreshold, PicTh: bd.PictureThreshold, TriggerMin: bd.TriggerMin,
+		FFmpegD: o.Duration, MaxJoinGapS: float64(maxBlackJoinGap) / ts.Hz, EdgeToleranceFrames: 0.5,
+		FallbackFrameTicks: fallbackFrameTicks, Workers: bd.Workers, TimeoutS: bd.Timeout.Seconds(),
+		AllowOpenH264: bd.AllowOpenH264, ColorRange: cmp.Or(rng, "as signaled"),
 	}
-	return keepBlack(placeBlack(seg, iv, frame), m.cfg.Blackdetect.Duration), nil
 }
+
+// blackResult is what the black check found in one segment: its black
+// runs, and how much of its video ffmpeg decoded.
+type blackResult struct {
+	runs   []BlackInterval
+	decode BlackDecode
+	last   *int64 // the last frame decoded, as ffmpeg gave its PTS
+}
+
+// blackRuns runs blackdetect on a saved segment and places the runs it
+// finds in seg's PTS; frame is the video frame duration in ticks and rng
+// the channel's color_range ("" for what the stream signals). Runs with
+// less than d of black frames that can't join a neighbour are dropped
+// (see keepBlack).
+func (m *Monitor) blackRuns(ctx context.Context, path string, seg *analysis.Segment, frame int64, rng string) (blackResult, error) {
+	res, err := m.detectBlack(ctx, path, seg.Video.PID, rng)
+	if bad, ok := errors.AsType[*blackdetect.FormatError](err); ok {
+		// Nothing ffmpeg printed is used: no black, and no guess.
+		why := "ffmpeg printed output that can't be read with certainty: " + bad.Error()
+		return blackResult{decode: BlackDecode{Frames: len(seg.Video.AUs), NotChecked: why}}, &notCheckedError{why}
+	}
+	if err != nil {
+		return blackResult{}, err
+	}
+	if m.opts.BlackDetector != nil {
+		res.Frames = framesFromIntervals(seg.Video, res.Intervals, frame)
+	}
+	r := blackResult{
+		runs:   keepBlack(placeBlack(seg, res, frame), m.cfg.Blackdetect.Duration),
+		decode: decodeSummary(seg, res, frame),
+	}
+	if n := len(res.Frames); n > 0 {
+		r.last = new(res.Frames[n-1].PTS)
+	}
+	if r.decode.NotChecked != "" {
+		for i := range r.runs {
+			r.runs[i].Unconfirmed = true
+		}
+		return r, &notCheckedError{r.decode.NotChecked}
+	}
+	return r, nil
+}
+
+// notCheckedError is blackRuns' error for a segment whose check is
+// incomplete: what it found is returned with it, unconfirmed.
+type notCheckedError struct{ why string }
+
+func (e *notCheckedError) Error() string { return "black not fully checked: " + e.why }
 
 // safely runs f, turning a panic into an error with the stack in the log,
 // so the incident and health loops outlive a bug.

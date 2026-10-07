@@ -1,6 +1,6 @@
 package hls
 
-// Audit (2026-09-30): fuzz targets for the playlist parsers.
+// Audit: fuzz targets for the playlist parsers.
 
 import (
 	"math"

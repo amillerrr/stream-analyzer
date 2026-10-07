@@ -6,6 +6,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	json "encoding/json/v2"
 	"errors"
@@ -14,7 +15,6 @@ import (
 	"io"
 	"log/slog"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	rtdebug "runtime/debug"
@@ -24,6 +24,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/amillerrr/stream-analyzer/internal/blackdetect"
 	"github.com/amillerrr/stream-analyzer/internal/config"
 	"github.com/amillerrr/stream-analyzer/internal/monitor"
 	"github.com/amillerrr/stream-analyzer/internal/report"
@@ -109,12 +110,6 @@ func run(args []string, stderr io.Writer) error {
 			return err
 		}
 	}
-	if cfg.Blackdetect.Enabled {
-		if _, err := exec.LookPath(cfg.Blackdetect.FFmpeg); err != nil {
-			return fmt.Errorf("blackdetect needs ffmpeg: %w (install it, set blackdetect.ffmpeg, or set blackdetect.enabled: false)", err)
-		}
-	}
-
 	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
 		return err
 	}
@@ -144,31 +139,62 @@ func run(args []string, stderr io.Writer) error {
 		level = slog.LevelDebug
 	}
 	logger := newLogger(out, level)
+	useLogger(logger)
 
-	m, err := monitor.New(monitor.Options{Config: cfg, Logger: logger})
-	if err != nil {
-		return err
-	}
 	// SIGHUP too: closing the terminal window should close incidents
 	// cleanly, not leave them to be marked interrupted on the next start.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer stop()
+	var build blackdetect.Build
+	if cfg.Blackdetect.Enabled {
+		if build, err = checkFFmpeg(ctx, &cfg.Blackdetect, logger); err != nil {
+			logger.Error("not starting", "error", err)
+			return err
+		}
+	}
+	m, err := monitor.New(monitor.Options{Config: cfg, Logger: logger, FFmpeg: build})
+	if err != nil {
+		return err
+	}
 	return m.Run(ctx)
 }
 
+// checkFFmpeg finds the ffmpeg black detection runs and checks it (see
+// blackdetect.Inspect), logs what it found, and makes every run use that
+// exact binary.
+func checkFFmpeg(ctx context.Context, bd *config.Blackdetect, logger *slog.Logger) (blackdetect.Build, error) {
+	b, err := blackdetect.Inspect(ctx, bd.Options, bd.AllowOpenH264)
+	if err != nil {
+		return b, err
+	}
+	logger.Info("ffmpeg", "path", b.Path, "configured", bd.FFmpeg, "version", b.Version,
+		"h264_decoder", b.H264, "hevc_decoder", cmp.Or(b.HEVC, "none"),
+		"self_test", "passed", "self_test_decoder", b.SelfTestDecoder, "allow_openh264", bd.AllowOpenH264)
+	for _, w := range b.Warnings() {
+		logger.Warn(w)
+	}
+	bd.FFmpeg = b.Path
+	return b, nil
+}
+
 // newLogger logs text lines to w with UTC times, like every file the
-// monitor writes.
+// monitor writes: the line's own time and any time in its attributes.
 func newLogger(w io.Writer, level slog.Level) *slog.Logger {
 	return slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{
 		Level: level,
 		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
-			if a.Key == slog.TimeKey && len(groups) == 0 && a.Value.Kind() == slog.KindTime {
+			if a.Value.Kind() == slog.KindTime {
 				a.Value = slog.TimeValue(a.Value.Time().UTC())
 			}
 			return a
 		},
 	}))
 }
+
+// useLogger makes l the default logger, so lines from Go's log package
+// (net/http's server errors) are written by it too, in UTC and to the log
+// file, rather than in local time to stderr only.
+func useLogger(l *slog.Logger) { slog.SetDefault(l) }
 
 // logWriter writes each log line to the log file first, then to stderr.
 // Once stderr fails (a closed pipe or terminal) it is left alone, and the
@@ -297,17 +323,19 @@ func runReanalyze(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("reanalyze: %w", err)
 	}
-	if cfg.Blackdetect.Enabled {
-		if _, err := exec.LookPath(cfg.Blackdetect.FFmpeg); err != nil {
-			return fmt.Errorf("reanalyze: blackdetect needs ffmpeg: %w (install it, set blackdetect.ffmpeg, or set blackdetect.enabled: false)", err)
-		}
-	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	logger := newLogger(stderr, slog.LevelWarn)
+	useLogger(logger)
+	var build blackdetect.Build
+	if cfg.Blackdetect.Enabled {
+		if build, err = checkFFmpeg(ctx, &cfg.Blackdetect, logger); err != nil {
+			return fmt.Errorf("reanalyze: %w", err)
+		}
+	}
 	failed := 0
 	for _, dir := range fs.Args() {
-		r, err := monitor.Reanalyze(ctx, dir, monitor.Options{Config: cfg, Logger: logger})
+		r, err := monitor.Reanalyze(ctx, dir, monitor.Options{Config: cfg, Logger: logger, FFmpeg: build})
 		if err != nil {
 			fmt.Fprintf(stderr, "stream-analyzer reanalyze: %s: %v\n", dir, err)
 			failed++

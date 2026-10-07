@@ -1,6 +1,6 @@
 package config
 
-// Audit (2026-09-30): fuzz target for config parsing. Whatever the input,
+// Audit: fuzz target for config parsing. Whatever the input,
 // Parse must either fail or return a config that satisfies its own rules.
 
 import (

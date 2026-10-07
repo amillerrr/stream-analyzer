@@ -318,11 +318,12 @@ func TestVariantFrameTicks(t *testing.T) {
 }
 
 // A variant's label names files and directories, so it is built from
-// parts that can't hold a path: RESOLUTION as WxH digits only.
+// parts that can't hold a path: RESOLUTION as WxH digits only. Without
+// RESOLUTION or CODECS, it can't be told whether it is audio.
 func TestVariantLabelIsSafe(t *testing.T) {
 	for res, want := range map[string]string{
 		"1280x720":                  "1_1280x720_500000",
-		"":                          "1_audio_500000",
+		"":                          "1_unknown_500000",
 		"../../../../../../escaped": "1_unknown_500000",
 		"1280x720/..":               "1_unknown_500000",
 		"1280X720":                  "1_unknown_500000",

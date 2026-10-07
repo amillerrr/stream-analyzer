@@ -15,7 +15,7 @@ import (
 func TestReportTimesAreUTC(t *testing.T) {
 	cfg := testConfig(t, "http://127.0.0.1:1/never.m3u8")
 	pdt := time.FixedZone("PDT", -7*3600)
-	clock := time.Date(2026, 9, 30, 4, 29, 57, 0, pdt)
+	clock := time.Date(2026, 1, 3, 4, 29, 57, 0, pdt)
 	m := newTestMonitor(t, cfg, func() time.Time { return clock })
 	m.incidents.fault(m.channels[0], []analysis.Fault{{Type: analysis.FaultPTSBehindPCR, Seq: 1}}, SegmentRecord{Seq: 1, URI: "a"})
 	clock = clock.Add(2 * time.Minute)
@@ -44,7 +44,7 @@ func TestReportTimesAreUTC(t *testing.T) {
 // or the wall clock being stepped, shows as wall time and monotonic time
 // disagreeing between two health ticks.
 func TestClockJump(t *testing.T) {
-	t0 := time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC)
+	t0 := time.Date(2026, 1, 3, 12, 0, 0, 0, time.UTC)
 	for _, tc := range []struct {
 		name       string
 		wall, mono time.Duration

@@ -53,7 +53,10 @@ type SegmentRecord struct {
 	Fetch    FetchMeta         `json:"fetch"`
 	Analysis *analysis.Summary `json:"analysis,omitempty"`
 	Black    []BlackInterval   `json:"black_intervals,omitempty"`
-	Faults   []string          `json:"faults,omitempty"`
+	// BlackDecode says how much of the video ffmpeg decoded for the black
+	// check.
+	BlackDecode *BlackDecode `json:"black_decode,omitempty"`
+	Faults      []string     `json:"faults,omitempty"`
 	// Gap lists sequence numbers before this one that were never analyzed
 	// (our fetch failed or they left the playlist first). No continuity
 	// check was made across them.
@@ -83,6 +86,13 @@ type Channel struct {
 	lastNum   uint64
 	lastState handled
 	pending   *analysis.Gap
+	// For black faults' thumbnails: the segment being checked (its file
+	// and video PID), the last frame decoded before it, and the strip
+	// its black fault wants.
+	tileFile  string
+	tilePID   uint16
+	lastFrame *frameRef
+	strip     *stripJob
 
 	mu         sync.Mutex
 	variants   []hls.Variant // every variant, when the URL is a master playlist
@@ -115,6 +125,11 @@ type segJob struct {
 	skipped *analysis.Gap
 	reset   bool // media sequence restarted: forget the comparison state
 }
+
+// segmentFile names a segment's files, without extension:
+// seg_<number>_<hash of its URI>. Numbers need not be unique, so two
+// segments with one number never share or overwrite a file.
+func segmentFile(num uint64, uri string) string { return "seg_" + hls.SegmentKey(num, uri) }
 
 // handled is how the worker's last segment ended.
 type handled int
@@ -168,10 +183,14 @@ type cueMark struct {
 // blackCarry is a black run that reached the end of a segment and may
 // continue into the next one.
 type blackCarry struct {
-	open       bool
-	start, end uint64 // where the run started, and ends on screen so far, in PTS
-	seconds    float64
-	frames     int // black frames so far
+	open        bool
+	start, end  uint64 // where the run started, and ends on screen so far, in PTS
+	seconds     float64
+	frames      int     // black frames so far
+	blackS      float64 // their time on screen
+	undecoded   int     // frames inside it ffmpeg did not decode
+	unconfirmed bool    // part of it is in a segment not fully checked
+	tiles       *blackTiles
 }
 
 func newChannel(m *Monitor, cc config.Channel) *Channel {
@@ -414,7 +433,11 @@ func (p *pollState) update(pl *hls.Media, base, name string, meta FetchMeta, now
 	// from another cache, or the packager restarted. Only a second playlist
 	// on the same new timeline confirms a restart; until then it is stale
 	// and says nothing new.
-	backward := p.started && len(segs) > 0 && u.newest < p.last
+	// A playlist that still lists the newest segment queued is neither,
+	// whatever its numbers: they are the packager's own and may repeat or
+	// go back (an ad break numbered from 1).
+	lists := slices.ContainsFunc(segs, func(s hls.Segment) bool { return s.URI == p.lastURI })
+	backward := p.started && len(segs) > 0 && u.newest < p.last && !lists
 	u.restart = backward && confirmsRestart(p.backward, pl, p.queued)
 	u.stale = backward && !u.restart
 	switch prev := p.prev; {
@@ -518,7 +541,11 @@ func (p *pollState) windowJump(pl *hls.Media, now time.Time) *analysis.Gap {
 			return nil
 		}
 	}
-	from, to := prev.Segments[len(prev.Segments)-1].Number()+1, pl.Segments[0].Number()
+	a, b := prev.Segments[len(prev.Segments)-1], pl.Segments[0]
+	if a.HasURISeq != b.HasURISeq || a.HasURISeq && hls.Dir(a.URI) != hls.Dir(b.URI) {
+		return nil // two packagers' numbers, or numbers against positions: nothing to count
+	}
+	from, to := a.Number()+1, b.Number()
 	if to <= from {
 		return nil
 	}
@@ -863,7 +890,7 @@ func (c *Channel) frameTicks() int64 {
 // frame is the channel's video frame duration for seg: the variant's
 // FRAME-RATE, or what the chain learned from recent segments, or seg's own.
 func (c *Channel) frame(seg *analysis.Segment) int64 {
-	return cmp.Or(c.frameTicks(), c.chain.Frame(), seg.Video.FrameTicks, 3003)
+	return cmp.Or(c.frameTicks(), c.chain.Frame(), seg.Video.FrameTicks, fallbackFrameTicks)
 }
 
 // saveFetch writes a fetched playlist and its metadata to the buffer.
@@ -1004,7 +1031,7 @@ func (c *Channel) process(ctx context.Context, j segJob) {
 	if ctx.Err() != nil {
 		return // shutting down
 	}
-	c.saveRefusals(j.num, &rec.Fetch, bodies, body, err != nil)
+	c.saveRefusals(j.num, s.URI, &rec.Fetch, bodies, body, err != nil)
 	if recovered {
 		c.count(func(st *stats) { st.originRecovered++ })
 		c.log.Info("segment fetched on retry after an origin error", "seq", j.num, "failed", rec.Fetch.FailedStatuses)
@@ -1026,7 +1053,7 @@ func (c *Channel) process(ctx context.Context, j segJob) {
 		state = handledFailed
 		c.log.Warn("segment fetch failed; it will show as a monitor gap", "seq", j.num, "error", err)
 	default:
-		rec.File = fmt.Sprintf("seg_%d.ts", j.num)
+		rec.File = segmentFile(j.num, s.URI) + ".ts"
 		// The incident this file goes into, if any, stays open until the
 		// segment's sidecar and record have joined it.
 		held = c.m.incidents.hold(c.name, rec.File)
@@ -1140,16 +1167,16 @@ func (c *Channel) advance(j segJob, st handled, order analysis.Order) {
 	c.lastURI, c.lastNum, c.lastState = j.seg.URI, j.num, st
 }
 
-// saveRefusals writes the body of each refused attempt at segment num next
-// to the segment's files, as seg_N.attemptK.body, and names the file in
-// that attempt's metadata. bodies are the earlier attempts', body the
-// last one's, which was refused too when failed.
-func (c *Channel) saveRefusals(num uint64, meta *FetchMeta, bodies [][]byte, body []byte, failed bool) {
+// saveRefusals writes the body of each refused attempt at segment num
+// (with URI uri) next to the segment's files, as seg_<N>_<hash>.attemptK.body,
+// and names the file in that attempt's metadata. bodies are the earlier
+// attempts', body the last one's, which was refused too when failed.
+func (c *Channel) saveRefusals(num uint64, uri string, meta *FetchMeta, bodies [][]byte, body []byte, failed bool) {
 	save := func(m *FetchMeta, b []byte) {
 		if !refused(m.Status) || len(b) == 0 {
 			return
 		}
-		name := fmt.Sprintf("seg_%d.attempt%d.body", num, m.Attempts)
+		name := fmt.Sprintf("%s.attempt%d.body", segmentFile(num, uri), m.Attempts)
 		if c.persist(kindSegments, name, b) == nil {
 			m.BodyFile = name
 		}
@@ -1258,27 +1285,72 @@ func (c *Channel) check(ctx context.Context, rec *SegmentRecord, body []byte, or
 		c.baseline = new(b)
 		c.mu.Unlock()
 	}
-	if c.m.cfg.Blackdetect.Enabled && seg.Video != nil && rec.File != "" {
-		black, err := c.m.blackRuns(ctx, filepath.Join(c.dir, rec.File), seg, c.frame(seg))
-		switch {
-		case err != nil && ctx.Err() == nil:
-			c.log.Warn("blackdetect failed", "seq", rec.Seq, "error", err)
-			c.count(func(s *stats) { s.blackErrors++ })
-			c.dropBlack()
-		case err == nil:
-			rec.Black = black
-			if f, ok := c.blackTrigger(rec.Seq, order.Adjacent && !rec.Discontinuity, seg, rec.Black); ok {
-				faults = append(faults, f)
-			}
-		}
-	} else {
+	if !c.m.cfg.Blackdetect.Enabled {
 		c.dropBlack()
+		return faults, true
+	}
+	if skipped := blackSkipped(seg, rec.File); skipped != "" {
+		rec.BlackDecode = &BlackDecode{NotChecked: skipped}
+		c.log.Info("black not checked", "seq", rec.Seq, "why", skipped)
+		c.count(func(s *stats) { s.blackNotChecked++ })
+		c.dropBlack()
+		return faults, true
+	}
+	br, err := c.m.blackRuns(ctx, filepath.Join(c.dir, rec.File), seg, c.frame(seg), c.cfg.ColorRange)
+	notChecked, incomplete := errors.AsType[*notCheckedError](err)
+	switch {
+	case err != nil && !incomplete && ctx.Err() == nil:
+		c.log.Warn("blackdetect failed", "seq", rec.Seq, "error", err)
+		c.count(func(s *stats) { s.blackErrors++ })
+		c.dropBlack()
+	case err == nil || incomplete:
+		rec.Black, rec.BlackDecode = br.runs, &br.decode
+		c.count(func(s *stats) {
+			s.leadingDropped += br.decode.LeadingDropped
+			if incomplete {
+				s.blackNotChecked++
+			}
+		})
+		if incomplete {
+			c.log.Warn("black not fully checked; black found in it is unconfirmed", "seq", rec.Seq, "why", notChecked.why)
+		}
+		// Strips need the frames ffmpeg decoded, not a stand-in detector's.
+		c.tileFile, c.tilePID, c.strip = "", seg.Video.PID, nil
+		if c.m.opts.BlackDetector == nil {
+			c.tileFile = rec.File
+		}
+		if f, ok := c.blackTrigger(rec.Seq, order.Adjacent && !rec.Discontinuity, seg, rec.Black); ok {
+			if c.strip != nil {
+				c.strip.uri, c.strip.name = rec.URI, stripName(rec.Seq, rec.URI)
+				f.Values["thumbnails"] = c.strip.name
+			}
+			faults = append(faults, f)
+		}
+		c.lastFrame = nil
+		if br.last != nil && c.tileFile != "" {
+			c.lastFrame = &frameRef{file: c.tileFile, pid: c.tilePID, pts: *br.last}
+		}
+		if br.decode.Undecoded > 0 {
+			faults = append(faults, undecodedFault(rec.Seq, br.decode))
+		}
 	}
 	return faults, true
 }
 
+// blackSkipped says why a segment's black check can't run at all, or "".
+func blackSkipped(seg *analysis.Segment, file string) string {
+	switch {
+	case seg.Video == nil:
+		return "the segment has no video stream"
+	case file == "":
+		return "the segment's file could not be saved for ffmpeg"
+	}
+	return ""
+}
+
 // blackTrigger joins black runs across segment boundaries and returns a
-// fault when the longest run reaches trigger_min. A run that lasts to the
+// fault when the run with the most black frames has trigger_min of them:
+// time with no frame, and frames ffmpeg did not decode, never count. A run that lasts to the
 // end of the segment stays open until the next segment shows whether it
 // goes on; every run is counted, once it ends, as short if it never reached
 // trigger_min. Runs are joined in PTS (see joinsBlack).
@@ -1292,44 +1364,76 @@ func (c *Channel) blackTrigger(seq uint64, adjacent bool, seg *analysis.Segment,
 	frame := c.frame(seg)
 	joins := carry.open && adjacent && len(runs) > 0 && runs[0].FromStart && joinsBlack(carry.end, runs[0].StartPTS, frame)
 	if carry.open && !joins {
-		c.endBlackRun(carry.seconds) // it ended at the boundary
+		c.endBlackRun(carry.blackS) // it ended at the boundary
 	}
 	var best blackSpan
 	for i, run := range runs {
-		s := blackSpan{start: run.StartPTS, end: run.EndPTS, seconds: run.Duration, frames: run.Frames}
+		s := blackSpan{
+			start: run.StartPTS, end: run.EndPTS, seconds: run.Duration,
+			frames: run.Frames, blackS: run.BlackS, undecoded: run.UndecodedFrames, unconfirmed: run.Unconfirmed,
+		}
+		s.tiles = &blackTiles{}
+		if i == 0 && joins {
+			s.tiles = carry.tiles.clone()
+		} else if run.before != nil {
+			s.tiles.before = &frameRef{file: c.tileFile, pid: c.tilePID, pts: *run.before}
+		} else if adjacent && run.FromStart {
+			s.tiles.before = c.lastFrame
+		}
+		for _, p := range run.black {
+			s.tiles.add(frameRef{file: c.tileFile, pid: c.tilePID, pts: p})
+		}
+		if run.after != nil {
+			s.tiles.after = &frameRef{file: c.tileFile, pid: c.tilePID, pts: *run.after}
+		}
 		if i == 0 && joins {
 			s.start, s.frames = carry.start, carry.frames+run.Frames
+			s.blackS, s.undecoded = carry.blackS+run.BlackS, carry.undecoded+run.UndecodedFrames
+			s.unconfirmed = s.unconfirmed || carry.unconfirmed
 			s.seconds = float64(ts.Diff(run.EndPTS, s.start)) / ts.Hz
 			s.joined = float64(ts.Diff(run.StartPTS, s.start)) / ts.Hz
 		}
-		if s.seconds > best.seconds {
+		if s.blackS > best.blackS {
 			best = s
 		}
 		if i == len(runs)-1 && run.ToEnd {
-			c.black = blackCarry{open: true, start: s.start, end: s.end, seconds: s.seconds, frames: s.frames}
+			c.black = blackCarry{
+				open: true, start: s.start, end: s.end, seconds: s.seconds,
+				frames: s.frames, blackS: s.blackS, undecoded: s.undecoded, unconfirmed: s.unconfirmed,
+				tiles: s.tiles,
+			}
 		} else {
-			c.endBlackRun(s.seconds)
+			c.endBlackRun(s.blackS)
 		}
 	}
 	bd := c.m.cfg.Blackdetect
-	if len(runs) == 0 || best.seconds < bd.TriggerMin {
+	if len(runs) == 0 || best.blackS < bd.TriggerMin {
 		return analysis.Fault{}, false
 	}
-	return blackFault(seq, runs, best, frame, bd), true
+	f := blackFault(seq, runs, best, frame, bd)
+	if c.tileFile != "" && best.tiles != nil && best.tiles.seen > 0 {
+		c.strip = &stripJob{seq: seq, tiles: best.tiles}
+	}
+	return f, true
 }
 
 // blackSpan is a black run, possibly joined across segments.
 type blackSpan struct {
-	start, end uint64  // PTS: the first black frame, and where the black ends on screen
+	start, end uint64  // PTS: the first black frame, and one frame past the last
 	seconds    float64 // on screen
 	frames     int     // black frames
+	blackS     float64 // their time on screen
+	undecoded  int     // frames inside it ffmpeg did not decode
 	joined     float64 // seconds of it before this segment
+	// unconfirmed: part of it is in a segment not fully checked.
+	unconfirmed bool
+	tiles       *blackTiles // where its frames are, for its thumbnails
 }
 
-// endBlackRun counts a black run that has ended as short if it was too
-// short to open an incident by itself.
-func (c *Channel) endBlackRun(seconds float64) {
-	if bd := c.m.cfg.Blackdetect; seconds >= bd.Duration && seconds < bd.TriggerMin {
+// endBlackRun counts a black run that has ended as short if it had too few
+// black frames (black seconds of them) to open an incident by itself.
+func (c *Channel) endBlackRun(black float64) {
+	if bd := c.m.cfg.Blackdetect; black >= bd.Duration && black < bd.TriggerMin {
 		c.count(func(s *stats) { s.shortBlack++ })
 	}
 }
@@ -1338,7 +1442,7 @@ func (c *Channel) endBlackRun(seconds float64) {
 // it (a gap, an unusable segment, a failed check or a restart).
 func (c *Channel) dropBlack() {
 	if c.black.open {
-		c.endBlackRun(c.black.seconds)
+		c.endBlackRun(c.black.blackS)
 	}
 	c.black = blackCarry{}
 }
@@ -1356,7 +1460,7 @@ func (c *Channel) finish(rec SegmentRecord, faults []analysis.Fault, held *incid
 	}
 	defer c.m.incidents.release(target, rec.File)
 	rec.addFaults(faults)
-	c.persistJSONTo(target, kindSegments, fmt.Sprintf("seg_%d.json", rec.Seq), rec)
+	c.persistJSONTo(target, kindSegments, segmentFile(rec.Seq, rec.URI)+".json", rec)
 	c.remember(rec)
 	c.logEvents(rec)
 	for _, f := range faults {
@@ -1364,6 +1468,15 @@ func (c *Channel) finish(rec SegmentRecord, faults []analysis.Fault, held *incid
 	}
 	if len(faults) > 0 {
 		c.m.incidents.faultFrom(c, faults, rec, target)
+		if job := c.strip; job != nil && job.seq == rec.Seq {
+			c.strip = nil
+			if dir := c.m.incidents.openDir(c.name); dir != "" {
+				if err := c.makeStrip(c.m.runContext(), dir, *job); err != nil {
+					c.log.Warn("cannot make the black fault's thumbnails", "seq", rec.Seq, "error", err)
+					c.m.incidents.note(c, fmt.Sprintf("the thumbnails for the black fault on segment %d could not be made: %v", rec.Seq, err))
+				}
+			}
+		}
 	} else {
 		c.m.incidents.segmentFrom(c, rec, target)
 	}
@@ -1462,47 +1575,77 @@ func (c *Channel) count(f func(*stats)) {
 }
 
 // blackFault turns a segment's black runs into a fault; longest is the
-// longest run through it and frame the video frame duration in ticks.
+// run through it with the most black frames and frame the video frame
+// duration in ticks.
 func blackFault(seq uint64, runs []BlackInterval, longest blackSpan, frame int64, bd config.Blackdetect) analysis.Fault {
 	var total float64
 	list := make([]map[string]any, 0, len(runs))
 	for _, r := range runs {
-		total += r.Duration
+		total += r.BlackS
 		list = append(list, map[string]any{
-			"start_s":      r.Start,
-			"end_s":        r.End,
-			"duration_s":   r.Duration,
-			"start_pts":    r.StartPTS,
-			"end_pts":      r.EndPTS,
-			"black_frames": r.Frames,
-			"no_frame_s":   r.NoFrameS,
+			"start_s":          r.Start,
+			"end_s":            r.End,
+			"duration_s":       r.Duration,
+			"start_pts":        r.StartPTS,
+			"end_pts":          r.EndPTS,
+			"black_frames":     r.Frames,
+			"black_frames_s":   r.BlackS,
+			"undecoded_frames": r.UndecodedFrames,
+			"no_frame_s":       r.NoFrameS,
+			"unconfirmed":      r.Unconfirmed,
 		})
 	}
-	framesS := float64(int64(longest.frames)*frame) / ts.Hz
-	noFrameS := noFrame(longest.seconds, longest.frames, frame)
-	msg := fmt.Sprintf("black run of %.3f s on screen: %.3f s of black frames and %.3f s with no frame (trigger_min %g s)",
-		longest.seconds, framesS, noFrameS, bd.TriggerMin)
+	noFrameS := noFrame(longest.seconds, longest.blackS, longest.undecoded, frame)
+	msg := fmt.Sprintf("%.3f s of black frames (%d frames) over a black run of %.3f s on screen, which has %.3f s with no frame and %d frames ffmpeg could not decode (trigger_min %g s)",
+		longest.blackS, longest.frames, longest.seconds, noFrameS, longest.undecoded, bd.TriggerMin)
 	if longest.joined > 0 {
-		msg += fmt.Sprintf(", including %.3f s before this segment", longest.joined)
+		msg += fmt.Sprintf(", including %.3f s on screen before this segment", longest.joined)
 	}
 	values := map[string]any{
-		"intervals":      list,
-		"total_black_s":  round3(total),
-		"longest_run_s":  round3(longest.seconds),
-		"black_frames":   longest.frames,
-		"black_frames_s": round3(framesS),
-		"no_frame_s":     round3(noFrameS),
-		"run_start_pts":  longest.start,
-		"run_end_pts":    longest.end,
-		"trigger_min":    bd.TriggerMin,
-		"d":              bd.Duration,
-		"pix_th":         bd.PixelThreshold,
-		"pic_th":         bd.PictureThreshold,
+		"intervals":        list,
+		"total_black_s":    round3(total),
+		"longest_run_s":    round3(longest.seconds),
+		"black_frames":     longest.frames,
+		"black_frames_s":   round3(longest.blackS),
+		"undecoded_frames": longest.undecoded,
+		"no_frame_s":       round3(noFrameS),
+		"run_start_pts":    longest.start,
+		"run_end_pts":      longest.end,
+		"trigger_min":      bd.TriggerMin,
+		"d":                bd.Duration,
+		"pix_th":           bd.PixelThreshold,
+		"pic_th":           bd.PictureThreshold,
+	}
+	if n := len(runs); n > 0 {
+		values["pix_fmt"], values["color_range"] = runs[n-1].PixFmt, runs[n-1].ColorRange
 	}
 	if longest.joined > 0 {
 		values["joined_previous_s"] = round3(longest.joined)
 	}
+	if longest.unconfirmed {
+		msg += "; unconfirmed: ffmpeg did not fully decode a segment it spans"
+		values["unconfirmed"] = true
+	}
 	return analysis.Fault{Type: analysis.FaultBlackVideo, Seq: seq, Message: msg, Values: values}
+}
+
+// undecodedFault reports frames the parser found that ffmpeg did not
+// decode after the first frame it did.
+func undecodedFault(seq uint64, d BlackDecode) analysis.Fault {
+	return analysis.Fault{
+		Type: analysis.FaultUndecodedFrames,
+		Seq:  seq,
+		Message: fmt.Sprintf("ffmpeg decoded %d of the %d frames the TS parser found: %d frames (%.3f s) after the first one it decoded were not decoded, so the black check did not see them",
+			d.Decoded, d.Frames, d.Undecoded, d.UndecodedS),
+		Values: map[string]any{
+			"frames":          d.Frames,
+			"decoded":         d.Decoded,
+			"undecoded":       d.Undecoded,
+			"undecoded_s":     d.UndecodedS,
+			"leading_dropped": d.LeadingDropped,
+			"ranges":          d.UndecodedRanges,
+		},
+	}
 }
 
 func round3(x float64) float64 { return math.Round(x*1000) / 1000 }

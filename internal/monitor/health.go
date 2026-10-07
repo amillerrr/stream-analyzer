@@ -32,6 +32,8 @@ type stats struct {
 	panics                               int               // panics recovered
 	originRecovered                      int               // refusals (4xx/5xx) cured by the retry
 	shortBlack                           int               // black runs that ended below trigger_min
+	blackNotChecked                      int               // segments whose black check was incomplete or skipped
+	leadingDropped                       int               // frames dropped before the first decodable one
 	targetChanges                        int               // EXT-X-TARGETDURATION changes (origin notes)
 	frameGaps                            int               // skipped frame slots (DTS gaps) inside segments
 	audioRetimed                         int               // segments with re-timed audio
@@ -130,9 +132,9 @@ func (m *Monitor) clockJumped(jump time.Duration, at time.Time) {
 var healthColumns = []string{
 	"time_utc", "channel", "rendition", "seq", "segments", "mb", "playlists", "playlist_errors",
 	"stale_playlists", "segment_errors", "origin_errors_recovered", "monitor_gaps", "faults",
-	"suppressed", "target_duration_changes", "short_black_runs", "frame_gaps", "audio_retimed", "stalled", "last_new_segment_age_s", "av_offset_ms",
+	"suppressed", "target_duration_changes", "short_black_runs", "leading_frames_dropped", "frame_gaps", "audio_retimed", "stalled", "last_new_segment_age_s", "av_offset_ms",
 	"av_baseline_ms", "min_pts_pcr_ms", "min_dts_pcr_ms",
-	"write_errors", "blackdetect_errors", "queue_drops", "resolve_errors", "panics", "last_processed_age_s", "free_gb",
+	"write_errors", "blackdetect_errors", "black_not_checked", "queue_drops", "resolve_errors", "panics", "last_processed_age_s", "free_gb",
 	"incident",
 }
 
@@ -140,7 +142,7 @@ var healthColumns = []string{
 // data/health.csv, then starts a new interval. The line is a warning when
 // nothing arrived, fetches failed, or anything stopped the monitor
 // collecting evidence or checking the stream: failed writes, blackdetect
-// failures, dropped queue entries, monitor gaps, an unresolvable channel
+// failures, segments whose black check was incomplete, dropped queue entries, monitor gaps, an unresolvable channel
 // URL, or free space under min_free_gb.
 func (c *Channel) logHealth() { c.writeHealth(false) }
 
@@ -170,6 +172,8 @@ func (c *Channel) writeHealth(final bool) {
 		"faults": strconv.Itoa(s.faults), "suppressed": strconv.Itoa(s.suppressed),
 		"target_duration_changes": strconv.Itoa(s.targetChanges),
 		"short_black_runs":        strconv.Itoa(s.shortBlack),
+		"leading_frames_dropped":  strconv.Itoa(s.leadingDropped),
+		"black_not_checked":       strconv.Itoa(s.blackNotChecked),
 		"frame_gaps":              strconv.Itoa(s.frameGaps), "audio_retimed": strconv.Itoa(s.audioRetimed),
 		"stalled": strconv.FormatBool(stalled), "incident": incident,
 		"write_errors": strconv.Itoa(s.writeErrors), "blackdetect_errors": strconv.Itoa(s.blackErrors),
@@ -187,7 +191,8 @@ func (c *Channel) writeHealth(final bool) {
 		"segment_errors", s.segmentErrors, "origin_errors_recovered", s.originRecovered,
 		"monitor_gaps", s.gaps, "faults", s.faults, "suppressed", s.suppressed,
 		"target_duration_changes", s.targetChanges,
-		"short_black_runs", s.shortBlack, "frame_gaps", s.frameGaps, "audio_retimed", s.audioRetimed)
+		"short_black_runs", s.shortBlack, "leading_frames_dropped", s.leadingDropped,
+		"frame_gaps", s.frameGaps, "audio_retimed", s.audioRetimed)
 	if stalled {
 		attrs = append(attrs, "stalled", true)
 	}
@@ -214,7 +219,7 @@ func (c *Channel) writeHealth(final bool) {
 		row["min_dts_pcr_ms"] = num(*s.minDTSPCR)
 	}
 	attrs = append(attrs, "write_errors", s.writeErrors, "blackdetect_errors", s.blackErrors,
-		"queue_drops", s.queueDrops, "resolve_errors", s.resolveErrors, "panics", s.panics)
+		"black_not_checked", s.blackNotChecked, "queue_drops", s.queueDrops, "resolve_errors", s.resolveErrors, "panics", s.panics)
 	if !lastSeg.IsZero() {
 		age := now.Sub(lastSeg).Round(100 * time.Millisecond)
 		attrs = append(attrs, "last_processed_age", age)
@@ -233,15 +238,22 @@ func (c *Channel) writeHealth(final bool) {
 	}
 
 	level := slog.LevelInfo
-	if !final && s.segments == 0 || s.segmentErrors > 0 || s.playlistErrors > 0 || stalled ||
-		s.writeErrors > 0 || s.blackErrors > 0 || s.queueDrops > 0 || s.resolveErrors > 0 || s.gaps > 0 ||
-		s.panics > 0 || lowDisk {
+	if s.warns(final, stalled, lowDisk) {
 		level = slog.LevelWarn
 	}
 	c.log.Log(context.Background(), level, "health", attrs...)
 	if err := c.m.appendCSV("health.csv", healthColumns, row); err != nil {
 		c.log.Error("cannot append to health.csv", "error", err)
 	}
+}
+
+// warns reports whether an interval's health line is a warning: nothing
+// arrived, fetches failed, or anything stopped the monitor collecting
+// evidence or checking the stream. final is the line written at shutdown.
+func (s stats) warns(final, stalled, lowDisk bool) bool {
+	return !final && s.segments == 0 || s.segmentErrors > 0 || s.playlistErrors > 0 || stalled ||
+		s.writeErrors > 0 || s.blackErrors > 0 || s.blackNotChecked > 0 || s.queueDrops > 0 ||
+		s.resolveErrors > 0 || s.gaps > 0 || s.panics > 0 || lowDisk
 }
 
 func num(x float64) string { return strconv.FormatFloat(x, 'f', -1, 64) }

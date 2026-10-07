@@ -24,11 +24,11 @@ func TestSecondMonitorOnADataDirectoryRefusesToStart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	open := filepath.Join(cfg.DataDir, "incidents", "20260929T120000Z_test")
+	open := filepath.Join(cfg.DataDir, "incidents", "20260102T120000Z_test")
 	if err := os.MkdirAll(open, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	report := `{"id":"20260929T120000Z_test","channel":"test","status":"open","opened_at":"2026-09-29T12:00:00Z"}`
+	report := `{"id":"20260102T120000Z_test","channel":"test","status":"open","opened_at":"2026-01-02T12:00:00Z"}`
 	if err := os.WriteFile(filepath.Join(open, "report.json"), []byte(report), 0o644); err != nil {
 		t.Fatal(err)
 	}
