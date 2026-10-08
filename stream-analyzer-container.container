@@ -1,0 +1,47 @@
+# stream-analyzer as a Podman Quadlet, for Rocky Linux, RHEL and their
+# relatives: the same settings as compose.yaml. It becomes the
+# stream-analyzer-container service. The name differs from the native
+# stream-analyzer.service on purpose: a unit file in /etc/systemd/system
+# takes priority over a generated one of the same name. See "Run in a
+# container" in the README. Needs Podman 5.0 or later for StopTimeout.
+
+[Unit]
+Description=stream-analyzer in a container
+Wants=network-online.target
+After=network-online.target
+
+[Container]
+Image=localhost/stream-analyzer:latest
+ContainerName=stream-analyzer
+# The capture endpoint listens only on loopback, so it has to be the
+# host's loopback to be reached from the host.
+Network=host
+# An init process forwards SIGTERM to the monitor and reaps children.
+RunInit=true
+# z gives the files a label every container can use. Z would give them one
+# only this container can use, so a second container mounting them would
+# lock this one out.
+Volume=/opt/stream-analyzer/channels.yaml:/config/channels.yaml:ro,z
+Volume=/opt/stream-analyzer/data:/data:z
+# Like the systemd unit's TimeoutStopSec: closing open incidents can wait
+# up to blackdetect.timeout (30 s) for an ffmpeg run.
+StopTimeout=60
+# The monitor writes only to /data, and its ffmpeg self-test to /tmp.
+ReadOnly=true
+Tmpfs=/tmp
+DropCapability=all
+NoNewPrivileges=true
+
+[Service]
+# Restarted whenever it exits, but not after systemctl stop, like Docker's
+# unless-stopped.
+Restart=always
+RestartSec=5
+# Longer than StopTimeout, so systemd doesn't kill podman while the
+# monitor is still closing incidents.
+TimeoutStopSec=90
+
+[Install]
+# multi-user.target starts the system service at boot, default.target a
+# user's (rootless) one.
+WantedBy=multi-user.target default.target

@@ -32,7 +32,9 @@ Go 1.27 or newer is needed only to build it (see `go.mod`). Black
 detection runs `ffmpeg`, which has to be on `PATH` (or named by
 `blackdetect.ffmpeg`), with ffmpeg's own H.264 decoder; 7.0 or later is
 recommended. Homebrew's and Debian's builds qualify; on the RHEL family use
-RPM Fusion's (see [Run on Linux](#run-on-linux)). Without ffmpeg, set
+RPM Fusion's (see [Run on Linux](#run-on-linux)), or run the container
+image, which brings its own (see [Run in a
+container](#run-in-a-container)). Without ffmpeg, set
 `blackdetect.enabled: false`. It runs on macOS and Linux and needs network
 access to the streams. HTTPS uses the system's CA certificates.
 
@@ -276,6 +278,204 @@ journalctl -u stream-analyzer -f
 before it exits. That can wait for an ffmpeg run of up to
 `blackdetect.timeout` (30 s), so `TimeoutStopSec` is 60. The data folder
 is `/opt/stream-analyzer/data`.
+
+## Run in a container
+
+The image holds the monitor and Debian 13's ffmpeg (7.1, with ffmpeg's own
+H.264 and HEVC decoders), which passes the self-test, so there is no ffmpeg
+to choose. It is built for amd64 and arm64 from this repository and holds
+only the binary: `channels.yaml` is mounted at `/config/channels.yaml` and
+the data folder at `/data`. The monitor runs as UID 10001, so the data
+folder must belong to it and `channels.yaml` must be readable by it. Leave
+`blackdetect.ffmpeg` at its default; `data_dir` is overridden.
+
+It uses the host's network, because the capture endpoint listens only on
+loopback, and gets 60 s to close open incidents when stopped, like the
+systemd unit. Its root filesystem is read-only and it has no capabilities.
+Docker Desktop's host network is its Linux VM's, so there, run the
+capture command inside the container.
+
+On Rocky Linux and RHEL, run the image either with Docker and
+`compose.yaml` or with Podman and the Quadlet
+`stream-analyzer-container.container`. Pick one, never both. Both build
+the image in a clone of the repository; a minimal install has no git, so
+run `sudo dnf install -y git` before cloning.
+
+### Switching from the native service
+
+The native service and the container can't run at once: both listen on
+port 8765 and lock the data folder. Stop and disable the native unit
+first:
+
+```bash
+sudo systemctl disable --now stream-analyzer
+```
+
+Then reuse its config and data folder, giving them to the container's
+user, or start fresh by moving the data folder aside (`sudo mv
+/opt/stream-analyzer/data /opt/stream-analyzer/data.native`):
+
+```bash
+sudo chown -R 10001:10001 /opt/stream-analyzer/channels.yaml /opt/stream-analyzer/data
+```
+
+The Quadlet mounts both as they are (skip the `cp channels.yaml` line
+below to keep this config); Docker needs them named in `.env` (see [Docker
+on Rocky Linux and RHEL](#docker-on-rocky-linux-and-rhel)).
+
+To go back to the native service, stop the container first. For Docker,
+run `sudo docker compose down` in the clone. For the Quadlet, run `sudo
+systemctl stop stream-analyzer-container`, then remove its file from
+`/etc/containers/systemd/` and run `sudo systemctl daemon-reload`, or it
+starts again at boot. Then give the files back and start the native unit:
+
+```bash
+sudo chown -R stream-analyzer:stream-analyzer /opt/stream-analyzer/channels.yaml /opt/stream-analyzer/data
+sudo systemctl enable --now stream-analyzer
+```
+
+### Docker
+
+In a clone of the repository, with `channels.yaml` next to `compose.yaml`
+(to use another config file or data folder, set `STREAM_ANALYZER_CONFIG` or
+`STREAM_ANALYZER_DATA` in the environment or in a `.env` file there):
+
+```bash
+mkdir -p data && sudo chown -R 10001:10001 data   # the chown is for Linux
+docker compose up -d --build
+docker compose logs -f
+curl -X POST 'http://127.0.0.1:8765/capture?channel=channel1'
+docker compose exec stream-analyzer curl -X POST 'http://127.0.0.1:8765/capture?channel=channel1'   # Docker Desktop
+docker compose exec stream-analyzer stream-analyzer report -data /data -from 2026-01-05 -to 2026-01-06
+docker compose exec stream-analyzer stream-analyzer reanalyze -config /config/channels.yaml /data/incidents/20260105T120000Z_channel1
+docker compose stop
+```
+
+The log is also in `data/stream-analyzer.log`; Docker's own copy is
+capped at three files of 10 MB. The container restarts after a crash or a
+reboot, but not after `docker compose stop`. After editing
+`channels.yaml`, `docker compose restart`. To upgrade, keep the running
+image as `previous` first:
+
+```bash
+docker tag stream-analyzer:latest stream-analyzer:previous
+git pull
+docker compose up -d --build
+docker image prune -f
+```
+
+The prune removes only untagged images, so `latest` and `previous` stay.
+
+To roll back:
+
+```bash
+docker tag stream-analyzer:previous stream-analyzer:latest
+docker compose up -d
+```
+
+#### Docker on Rocky Linux and RHEL
+
+Docker isn't in their own repositories: install Docker Engine from
+Docker's, following [Docker's RHEL
+guide](https://docs.docker.com/engine/install/rhel/). The guide removes
+Podman first, because the packages conflict; if something else on the
+server uses Podman, take the Podman path instead. The `docker` command
+from Rocky's `podman-docker` package is really Podman: if `docker
+--version` mentions Podman, Docker isn't installed yet.
+
+Start Docker now and at every boot, so the monitor comes back after a
+reboot:
+
+```bash
+sudo systemctl enable --now docker
+```
+
+Then run the `docker` commands above with `sudo` (`sudo docker compose up
+-d --build`), and give the data folder to the container's user with `sudo
+chown -R 10001:10001 data`. To use the native service's files instead,
+put this in `.env` next to `compose.yaml`:
+
+```
+STREAM_ANALYZER_CONFIG=/opt/stream-analyzer/channels.yaml
+STREAM_ANALYZER_DATA=/opt/stream-analyzer/data
+```
+
+### Podman on Rocky Linux and RHEL
+
+`stream-analyzer-container.container` is a Quadlet: systemd runs the
+container as the `stream-analyzer-container` service, with the same
+settings as `compose.yaml`. The name differs from the native
+`stream-analyzer.service` on purpose, since a unit file in
+`/etc/systemd/system` takes priority over a generated one of the same
+name. It mounts `/opt/stream-analyzer/channels.yaml` and
+`/opt/stream-analyzer/data` with `:z`, a label SELinux lets every
+container use. It needs Podman 5.0 or later (Rocky 9.5 and later), for
+`StopTimeout`. As a system service, in a clone of the repository:
+
+```bash
+sudo dnf install -y podman
+sudo podman build -t stream-analyzer:latest .
+sudo podman image prune -f
+sudo mkdir -p /opt/stream-analyzer/data
+sudo cp channels.yaml /opt/stream-analyzer/
+sudo chown -R 10001:10001 /opt/stream-analyzer/channels.yaml /opt/stream-analyzer/data
+sudo cp stream-analyzer-container.container /etc/containers/systemd/
+sudo systemctl daemon-reload
+sudo systemctl start stream-analyzer-container
+```
+
+Each `podman build` leaves an untagged image of about 1 GB, its build
+stage; the prune removes only untagged images, so `latest` and `previous`
+stay. The service starts at boot too, from the file's `[Install]` section;
+a Quadlet service can't be `systemctl enable`d.
+
+```bash
+sudo journalctl -u stream-analyzer-container -f
+curl -X POST 'http://127.0.0.1:8765/capture?channel=channel1'
+sudo podman exec stream-analyzer stream-analyzer report -data /data -from 2026-01-05 -to 2026-01-06
+sudo podman exec stream-analyzer stream-analyzer reanalyze -config /config/channels.yaml /data/incidents/20260105T120000Z_channel1
+sudo systemctl stop stream-analyzer-container
+```
+
+After editing `channels.yaml`, `sudo systemctl restart
+stream-analyzer-container`. To upgrade, and to roll back:
+
+```bash
+sudo podman tag stream-analyzer:latest stream-analyzer:previous
+git pull
+sudo podman build -t stream-analyzer:latest .
+sudo podman image prune -f
+sudo systemctl restart stream-analyzer-container
+```
+
+```bash
+sudo podman tag stream-analyzer:previous stream-analyzer:latest
+sudo systemctl restart stream-analyzer-container
+```
+
+#### Rootless Podman
+
+To run it as an ordinary user instead, do everything logged in as that
+user (over SSH or at the console: `su` and `sudo -u` give `systemctl
+--user` no session), without `sudo`: build the image with `podman build`,
+and copy the Quadlet to `~/.config/containers/systemd/`. In the copy,
+point the `Volume=` lines at the user's own `channels.yaml` and an
+existing data folder (`%h` is the home folder), and add this line under
+`[Container]`:
+
+```ini
+UserNS=keep-id:uid=10001,gid=10001
+```
+
+The user's own files then belong to UID 10001 in the container, so no
+`chown` is needed, but `channels.yaml` must be readable by the user.
+`systemctl --user daemon-reload` and `systemctl --user start
+stream-analyzer-container` start it, and `journalctl --user -u
+stream-analyzer-container` shows its log. An administrator's `sudo
+loginctl enable-linger USER` starts it at boot, without a login.
+
+On Proxmox VE, run the image in a VM. Proxmox VE 9.1 and later can run it
+as an OCI-based LXC container, but that is a technology preview.
 
 ## Manual capture
 

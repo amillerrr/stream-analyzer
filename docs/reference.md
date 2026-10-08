@@ -1004,16 +1004,19 @@ Tests that need ffmpeg, or one of its encoders (`mpeg2video`, `mp2`,
 ## Code layout
 
 ```
-main.go                 flags, config, logging, signals, report and reanalyze commands
-channels.example.yaml   a starting config
-internal/config         YAML config -> typed config, validation
-internal/yamlite        the YAML subset parser (stdlib only)
-internal/hls            master/media playlists, update rules, variant selection, SCTE-35 tags
-internal/ts             TS packets, PES headers, PAT/PMT (from ts-validator), 33-bit clock math
-internal/analysis       per-segment timing extraction and the checks
-internal/blackdetect    ffmpeg blackdetect runner, startup checks, self-test and its clips
-internal/monitor        polling, buffer, incidents, renditions, CSV, cap, HTTP trigger, health, reanalyze
-internal/report         the report subcommand: splice points, irregular segments, breaks, faults
-internal/tstest         synthetic TS builder and fixtures
-docs/reference.md       this file
+main.go                               flags, config, logging, signals, report and reanalyze commands
+channels.example.yaml                 a starting config
+Dockerfile                            the container image: the binary and Debian's ffmpeg
+compose.yaml                          the image as a Docker Compose service
+stream-analyzer-container.container   the image as a Podman Quadlet (the stream-analyzer-container service)
+internal/config                       YAML config -> typed config, validation
+internal/yamlite                      the YAML subset parser (stdlib only)
+internal/hls                          master/media playlists, update rules, variant selection, SCTE-35 tags
+internal/ts                           TS packets, PES headers, PAT/PMT (from ts-validator), 33-bit clock math
+internal/analysis                     per-segment timing extraction and the checks
+internal/blackdetect                  ffmpeg blackdetect runner, startup checks, self-test and its clips
+internal/monitor                      polling, buffer, incidents, renditions, CSV, cap, HTTP trigger, health, reanalyze
+internal/report                       the report subcommand: splice points, irregular segments, breaks, faults
+internal/tstest                       synthetic TS builder and fixtures
+docs/reference.md                     this file
 ```

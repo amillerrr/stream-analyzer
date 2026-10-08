@@ -1,0 +1,46 @@
+# stream-analyzer under Docker Compose. See "Run in a container" in the
+# README. The config and the data folder default to channels.yaml and data/
+# next to this file; STREAM_ANALYZER_CONFIG and STREAM_ANALYZER_DATA point
+# them elsewhere. The data folder must exist and belong to UID 10001.
+services:
+  stream-analyzer:
+    build: .
+    image: stream-analyzer:latest
+    # The capture endpoint listens only on loopback, so it has to be the
+    # host's loopback to be reached from the host.
+    network_mode: host
+    # An init process forwards SIGTERM to the monitor and reaps children.
+    init: true
+    # Like the systemd unit's TimeoutStopSec: closing open incidents can
+    # wait up to blackdetect.timeout (30 s) for an ffmpeg run.
+    stop_grace_period: 60s
+    restart: unless-stopped
+    # The monitor's output also goes to Docker's own log, which Docker
+    # never trims by default.
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+    # The monitor writes only to /data, and its ffmpeg self-test to /tmp.
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # z labels the files for SELinux, where Docker's SELinux support is on;
+    # otherwise it does nothing.
+    volumes:
+      - type: bind
+        source: ${STREAM_ANALYZER_CONFIG:-./channels.yaml}
+        target: /config/channels.yaml
+        read_only: true
+        bind:
+          selinux: z
+      - type: bind
+        source: ${STREAM_ANALYZER_DATA:-./data}
+        target: /data
+        bind:
+          selinux: z

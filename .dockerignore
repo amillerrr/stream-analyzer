@@ -1,0 +1,39 @@
+# The build needs only the Go sources. Everything else stays out of the
+# build context, so private files can't reach it or the image.
+*
+!go.mod
+!go.sum
+!*.go
+!internal/
+
+# What .gitignore leaves out, here too, wherever it turns up among the
+# sources above. Root-only entries in .gitignore are root-only here.
+.git
+/data/
+/stream-analyzer
+/stream-analyzer-darwin-*
+/stream-analyzer-linux-*
+**/*.exe
+/channels.yaml
+**/*.local.yaml
+/docs/audit/
+/docs/superpowers/
+/.claude/
+**/CLAUDE.md
+/.worktrees/
+**/.env
+**/.env.*
+**/*.pem
+**/*.key
+**/*.p12
+**/*.test
+**/*.out
+**/*.prof
+**/coverage.html
+**/*.log
+**/.DS_Store
+**/.vscode/
+**/.idea/
+**/*.swp
+**/*.swo
+**/*~

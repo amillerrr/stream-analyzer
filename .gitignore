@@ -4,7 +4,8 @@
 
 # Built binaries, including cross-compiled ones
 /stream-analyzer
-/stream-analyzer-*
+/stream-analyzer-darwin-*
+/stream-analyzer-linux-*
 *.exe
 
 # Real config with internal stream URLs.
